@@ -1,7 +1,17 @@
 const { Client, GatewayIntentBits } = require('discord.js');
 const { Mistral } = require('@mistralai/mistralai');
+const http = require('http'); // 1. Import built-in HTTP module
 
-// 1. Configure the Discord client with necessary permissions
+// 2. Create a fake web server to satisfy Render's port binding rule
+const port = process.env.PORT || 3000;
+http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Bot is running securely!\n');
+}).listen(port, () => {
+    console.log(`Web server listening on port ${port} to satisfy Render requirements.`);
+});
+
+// 3. Configure the Discord client
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -10,7 +20,7 @@ const client = new Client({
     ]
 });
 
-// 2. Instantiate the Mistral Client (Credentials pull directly from Render settings)
+// 4. Instantiate the Mistral Client
 const mistral = new Mistral({ 
     apiKey: process.env.MISTRAL_API_KEY || "bP9W1oC9M6FPIw6hbGHW3jywIS16uOVd" 
 });
@@ -20,25 +30,18 @@ client.once('ready', () => {
 });
 
 client.on('messageCreate', async (message) => {
-    // Drop the request if it comes from another bot
     if (message.author.bot) return;
-
-    // Check if the bot was explicitly tagged in the message
     if (!message.mentions.has(client.user)) return;
 
     try {
-        // Strip out the Discord user ping syntax so it doesn't taint the text query
         const cleanPrompt = message.content.replace(/<@!\d+>|<@\d+>/g, '').trim();
 
-        // If someone just pings the bot with no text, give them a gentle greeting
         if (!cleanPrompt) {
             return message.reply("Xin chào! Tôi có thể giúp gì cho bạn hôm nay?");
         }
 
-        // Trigger the visual "is typing..." animation in the Discord channel
         await message.channel.sendTyping();
 
-        // 3. Dispatch content to the Mistral model API
         const response = await mistral.chat.complete({
             model: "mistral-large-latest", 
             messages: [
@@ -53,10 +56,8 @@ client.on('messageCreate', async (message) => {
             ]
         });
 
-        // 4. Handle response delivery
         const botReply = response.choices[0].message.content;
         
-        // Prevent crashes by checking Discord's strict 2000 character limits
         if (botReply.length > 2000) {
             await message.reply(botReply.substring(0, 1999));
         } else {
@@ -69,5 +70,4 @@ client.on('messageCreate', async (message) => {
     }
 });
 
-// 5. Connect bot to Discord network
 client.login(process.env.DISCORD_TOKEN);
