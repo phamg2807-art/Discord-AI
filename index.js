@@ -510,7 +510,9 @@ client.on('messageCreate', async (message) => {
         if (hasImages) {
             userContent = [
                 { type: 'text', text: cleanPrompt || 'Hãy mô tả và phân tích (các) hình ảnh này.' },
-                ...imageUrls.map((url) => ({ type: 'image_url', image_url: url })),
+                // NOTE: the JS SDK requires camelCase "imageUrl", NOT "image_url" — using the
+                // snake_case key causes a silent validation failure that surfaces as a generic error.
+                ...imageUrls.map((url) => ({ type: 'image_url', imageUrl: url })),
             ];
         } else {
             userContent = cleanPrompt;
@@ -587,7 +589,8 @@ client.on('messageCreate', async (message) => {
             for (const chunk of chunks) await message.channel.send(chunk);
         }
     } catch (error) {
-        console.error('Execution Error:', error);
+        // Log full detail (SDK errors often carry a `.body` or `.rawValue` with the real reason)
+        console.error('Execution Error:', error?.body || error?.rawValue || error);
         await message.reply('Đã có lỗi xảy ra khi kết nối tới Mistral AI. Hãy thử lại sau nhé!');
     }
 });
