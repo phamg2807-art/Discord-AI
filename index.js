@@ -36,13 +36,20 @@ const mistral = new Mistral({ apiKey: process.env.MISTRAL_API_KEY || '' });
 // 3. Config
 // ============================================================
 const TEXT_MODEL = 'mistral-large-latest';       // code questions + admin/knowledge tool-calling
-const VISION_MODEL = 'pixtral-large-latest';      // vision fallback if OpenRouter is unavailable
+// NOTE (fixed 2026-07-13): pixtral-large-latest was deprecated 2026-02-27 and replaced by
+// Mistral Medium 3.5 (API id mistral-medium-latest), which has vision folded in. Using the old
+// id here was silently breaking the Mistral fallback path for image analysis.
+const VISION_MODEL = 'mistral-medium-latest';     // vision fallback if OpenRouter is unavailable
 const GROQ_MODEL_PRIMARY = 'llama-3.3-70b-versatile'; // general chat — fastest free option
 // NOTE: Groq announced (2026-06-17) that llama-3.3-70b-versatile / llama-3.1-8b-instant are being
 // sunset on the free/dev tier. openai/gpt-oss-120b is Groq's own recommended replacement, so it's
 // wired in as an automatic fallback below — no code change needed when the old model finally 404s.
 const GROQ_MODEL_FALLBACK = 'openai/gpt-oss-120b';
-const OPENROUTER_VISION_MODEL = 'nvidia/nemotron-3-nano-omni-30b-a3b:free'; // reads image/audio/video
+// NOTE (fixed 2026-07-13): the old id (nvidia/nemotron-3-nano-omni-30b-a3b:free) was wrong/rotated
+// out and returning errors. "openrouter/free" is OpenRouter's own auto-router — it inspects the
+// request (sees image_url content here) and picks a currently-live free model that supports vision,
+// so this won't silently break again the next time a specific free model gets renamed or retired.
+const OPENROUTER_VISION_MODEL = 'openrouter/free'; // reads image/audio/video, auto-routes to a live free model
 const HISTORY_LIMIT = 14;
 const FACT_LIMIT = 20;
 const RETRIEVAL_LIMIT = 4; // how many DB rows to pull into context per search
@@ -215,26 +222,39 @@ function pushHistory(channelId, entry) {
 // (b) any server-wide knowledge worth keeping (only saved when the
 //     message came from an Admin, so random members can't pollute the
 //     shared knowledge base).
-async function learnAndStore(userId, guildId, isAdmin, recentUserText) {
+async function learnAndStore(userId, guildId, isAdmin, recentUserText, recentHistory) {
     if (!dbEnabled() || !recentUserText || !recentUserText.trim()) return;
     try {
+        // Give the extractor a bit of surrounding context (last few turns), not just the
+        // single latest line — a lot of useful signal (who someone is, an ongoing project,
+        // a stated opinion/relationship) only makes sense with a turn or two of context.
+        const contextWindow = (recentHistory || []).slice(-6)
+            .map((m) => `${m.role === 'user' ? 'Người dùng' : 'Bot'}: ${m.content}`)
+            .join('\n');
+        const transcript = contextWindow
+            ? `Đoạn hội thoại gần đây:\n${contextWindow}\n\nTin nhắn mới nhất của người dùng: ${recentUserText}`
+            : `Tin nhắn của người dùng: ${recentUserText}`;
+
         const resp = await mistral.chat.complete({
             model: TEXT_MODEL,
             messages: [
                 {
                     role: 'system',
                     content:
-                        'Bạn đọc một tin nhắn của người dùng và quyết định có gì đáng nhớ LÂU DÀI hay không. ' +
-                        'CHỈ trích xuất thông tin thực sự hữu ích cho tương lai (sở thích, công việc, dự án đang làm, ' +
-                        'mục tiêu, ràng buộc, thông tin cá nhân họ chủ động chia sẻ...). ' +
-                        'ĐỪNG trích xuất các câu hỏi vãng lai, chào hỏi, hay thông tin không lâu dài. ' +
+                        'Bạn đọc đoạn hội thoại dưới đây và quyết định có gì đáng nhớ LÂU DÀI về người dùng hay không. ' +
+                        'Hãy rộng rãi một chút — không chỉ thông tin họ "khai báo" trực tiếp, mà cả những gì suy ra được ' +
+                        'một cách hợp lý: sở thích, công việc, dự án đang làm, mục tiêu, mối quan hệ hoặc quan điểm của họ ' +
+                        'về người/việc cụ thể, thói quen, hoàn cảnh... Nếu người dùng nhắc tới một người/sự việc cụ thể ' +
+                        'kèm quan điểm hay cảm xúc rõ ràng (vd: ghét, thích, tin tưởng, mâu thuẫn với ai đó), đó CŨNG đáng ghi nhớ. ' +
+                        'CHỈ bỏ qua lời chào hỏi thuần tuý, câu hỏi kỹ thuật nhất thời, hoặc câu nói không mang thông tin gì. ' +
                         'Nếu tin nhắn là quy định/thông tin chung áp dụng cho cả server (không chỉ riêng người này), ' +
                         'đưa vào "guild_knowledge" thay vì "user_facts". ' +
+                        'Viết mỗi mục ngắn gọn, ở ngôi thứ ba (vd: "Không thích một người tên Kenkai vì cho rằng anh ta ảo tưởng"). ' +
                         'CHỈ trả về JSON đúng định dạng: ' +
                         '{"user_facts": ["..."], "guild_knowledge": [{"topic": "...", "content": "..."}]}. ' +
-                        'Nếu không có gì đáng nhớ, trả {"user_facts": [], "guild_knowledge": []}.',
+                        'Nếu thực sự không có gì đáng nhớ, trả {"user_facts": [], "guild_knowledge": []}.',
                 },
-                { role: 'user', content: recentUserText },
+                { role: 'user', content: transcript },
             ],
             responseFormat: { type: 'json_object' },
             maxTokens: 300,
@@ -246,14 +266,16 @@ async function learnAndStore(userId, guildId, isAdmin, recentUserText) {
             const existingLower = new Set(existing.map((f) => f.fact.toLowerCase()));
             for (const fact of parsed.user_facts) {
                 if (fact && typeof fact === 'string' && !existingLower.has(fact.toLowerCase())) {
-                    await dbAddUserFact(userId, guildId, fact.slice(0, 500));
+                    const saved = await dbAddUserFact(userId, guildId, fact.slice(0, 500));
+                    if (saved) console.log(`🧠 Learned about ${userId}: ${fact}`);
                 }
             }
         }
         if (isAdmin && Array.isArray(parsed.guild_knowledge) && parsed.guild_knowledge.length) {
             for (const item of parsed.guild_knowledge) {
                 if (item && item.content) {
-                    await dbAddKnowledge(guildId, (item.topic || '').slice(0, 200), String(item.content).slice(0, 1000), userId);
+                    const saved = await dbAddKnowledge(guildId, (item.topic || '').slice(0, 200), String(item.content).slice(0, 1000), userId);
+                    if (saved) console.log(`📚 Saved guild knowledge for ${guildId}: ${item.content}`);
                 }
             }
         }
@@ -1028,7 +1050,7 @@ client.on('messageCreate', async (message) => {
         user.msgCount += 1;
         saveStoreSoon();
         // Fire-and-forget: decide what (if anything) is worth remembering long-term.
-        learnAndStore(message.author.id, message.guildId, isAdmin, cleanPrompt);
+        learnAndStore(message.author.id, message.guildId, isAdmin, cleanPrompt, history);
 
         if (botReply.length <= 2000) {
             await message.reply(botReply);
