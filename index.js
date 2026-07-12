@@ -1,6 +1,8 @@
 const { Client, GatewayIntentBits, Partials, PermissionsBitField, ChannelType, EmbedBuilder } = require('discord.js');
 const { Mistral } = require('@mistralai/mistralai');
 const { createClient } = require('@supabase/supabase-js');
+// >>> VOICE ADDITION: voice connection primitives from @discordjs/voice
+const { joinVoiceChannel, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -26,6 +28,7 @@ const client = new Client({
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.GuildMembers,
         GatewayIntentBits.GuildModeration,
+        GatewayIntentBits.GuildVoiceStates, // >>> VOICE ADDITION: required for voice channel join/state tracking
     ],
     partials: [Partials.Message, Partials.Channel],
 });
@@ -488,6 +491,58 @@ async function getVisionReply(systemPrompt, history, cleanPrompt, imageUrls) {
 }
 
 // ============================================================
+// 7c. VOICE ADDITION — join/leave a voice channel
+// ============================================================
+// This is step 1 of the voice feature: connect/disconnect only. No audio
+// capture, STT, or TTS yet — that comes in later steps. Kept intentionally
+// small and self-contained so it can be tested in isolation.
+const voiceConnections = new Map(); // guildId -> VoiceConnection
+
+async function joinUserVoiceChannel(message) {
+    const member = message.member;
+    const voiceChannel = member?.voice?.channel;
+    if (!voiceChannel) {
+        return { ok: false, result: 'You need to be in a voice channel first!' };
+    }
+
+    const existing = voiceConnections.get(message.guildId);
+    if (existing && existing.joinConfig.channelId === voiceChannel.id) {
+        return { ok: true, result: `Already connected to ${voiceChannel.name}.` };
+    }
+
+    try {
+        const connection = joinVoiceChannel({
+            channelId: voiceChannel.id,
+            guildId: message.guildId,
+            adapterCreator: message.guild.voiceAdapterCreator,
+            selfDeaf: false, // we need to actually hear users in later steps
+        });
+
+        await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+        voiceConnections.set(message.guildId, connection);
+
+        connection.on(VoiceConnectionStatus.Disconnected, () => {
+            console.log(`Voice disconnected in guild ${message.guildId}`);
+            voiceConnections.delete(message.guildId);
+        });
+
+        console.log(`✅ Joined voice channel "${voiceChannel.name}" in guild ${message.guildId}`);
+        return { ok: true, result: `🔊 Joined **${voiceChannel.name}**!` };
+    } catch (e) {
+        console.error('Voice join failed:', e.message);
+        return { ok: false, result: `Couldn't join voice channel: ${e.message}` };
+    }
+}
+
+function leaveVoiceChannel(guildId) {
+    const connection = voiceConnections.get(guildId);
+    if (!connection) return { ok: false, result: "I'm not in a voice channel." };
+    connection.destroy();
+    voiceConnections.delete(guildId);
+    return { ok: true, result: '👋 Left the voice channel.' };
+}
+
+// ============================================================
 // 8. Tool definitions (function calling schema for Mistral)
 // ============================================================
 const CHANNEL_TYPE_MAP = {
@@ -920,6 +975,9 @@ const HELP_TEXT = [
     '',
     '**Private AI channel**',
     `\`${PREFIX}aichat\` — create (or open) your own private chat channel with the AI. Everyone can see it, but only you can type there`,
+    // >>> VOICE ADDITION: help text entries for the new commands
+    `\`${PREFIX}voice join\` — join your current voice channel (IELTS speaking practice mode)`,
+    `\`${PREFIX}voice leave\` — leave the voice channel`,
     '',
     `You can also **mention the bot** (\`@SjpHelper\`) or **reply to one of its messages** with a question, any time.`,
 ].join('\n');
@@ -1051,6 +1109,20 @@ async function handleSlashLikeCommand(message) {
                     ? `✅ Created your private AI chat channel: ${channel}. Everyone in the server can still see it, but only you can send messages there — every message you send there is automatically treated as a message to me, no mention needed.`
                     : `You already have a private AI chat channel: ${channel}`
             );
+        }
+        // >>> VOICE ADDITION: -voice join / -voice leave
+        case 'voice': {
+            if (!message.guild) return message.reply("This command only works inside a server, not in DMs.");
+            const sub = rest.trim().toLowerCase();
+            if (sub === 'join') {
+                const result = await joinUserVoiceChannel(message);
+                return message.reply(result.result);
+            }
+            if (sub === 'leave') {
+                const result = leaveVoiceChannel(message.guildId);
+                return message.reply(result.result);
+            }
+            return message.reply(`Usage: \`${PREFIX}voice join\` or \`${PREFIX}voice leave\``);
         }
         default:
             return message.reply(`Unknown command \`${PREFIX}${cmd}\`. Type \`${PREFIX}help\` for the command list.`);
