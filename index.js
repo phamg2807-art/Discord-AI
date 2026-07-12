@@ -64,7 +64,9 @@ const DEFAULT_PERSONA =
     'Nếu câu hỏi của người dùng chưa đủ rõ, hoặc biết thêm về sở thích/công việc/dự án của họ sẽ giúp bạn trả lời tốt hơn ' +
     'sau này, hãy chủ động hỏi lại một cách tự nhiên (đừng hỏi dồn dập, tối đa một câu hỏi mỗi lượt). ' +
     'Khi người dùng chia sẻ điều gì đó lâu dài và hữu ích về bản thân, hãy ghi nhớ nó bằng công cụ remember_fact. ' +
-    'Trước khi trả lời điều gì đó có thể đã được lưu trước đây, hãy cân nhắc dùng công cụ search_knowledge để kiểm tra.';
+    'Trước khi trả lời điều gì đó có thể đã được lưu trước đây, hãy cân nhắc dùng công cụ search_knowledge để kiểm tra. ' +
+    'Luôn trả lời bằng tiếng Việt tự nhiên (hoặc tiếng Anh nếu người dùng nhắn bằng tiếng Anh) — không chèn chữ cái ' +
+    'từ hệ chữ khác (như tiếng Nga, tiếng Trung...) trừ khi người dùng thực sự yêu cầu.';
 
 // ============================================================
 // 4. Supabase — long-term knowledge database
@@ -309,6 +311,13 @@ async function buildSystemPrompt(guildId, userId, isAdmin, retrievedFacts, retri
 function looksLikeCode(text) {
     return /```/.test(text) || /\b(function|const|let|def |class |import |#include|SELECT |public static)\b/.test(text);
 }
+// Occasionally a small/free model (especially under hostile or heavily-profane input) degrades
+// into blending in stray characters from an unrelated script (e.g. Cyrillic mid-word: "конструktive").
+// Vietnamese/English text should never legitimately contain Cyrillic, so treat its presence as a
+// sign the generation glitched and should be retried on a different provider/model.
+function looksGarbled(text) {
+    return /[\u0400-\u04FF]/.test(text || '');
+}
 async function collectImageUrls(message) {
     const urls = [];
     for (const att of message.attachments.values()) {
@@ -367,10 +376,14 @@ async function getGeneralChatReply(messages) {
         try {
             if (step.provider === 'groq') {
                 const data = await callGroq(messages, { model: step.model, maxTokens: 900 });
-                return { text: data.choices[0].message.content, provider: `groq/${step.model}` };
+                const text = data.choices[0].message.content;
+                if (looksGarbled(text)) throw new Error(`Output looked garbled/mixed-script from ${step.model}, trying next provider`);
+                return { text, provider: `groq/${step.model}` };
             }
             const resp = await mistral.chat.complete({ model: step.model, messages, maxTokens: 900 });
-            return { text: resp.choices[0].message.content, provider: `mistral/${step.model}` };
+            const text = resp.choices[0].message.content;
+            if (looksGarbled(text)) throw new Error(`Output looked garbled/mixed-script from ${step.model}, trying next provider`);
+            return { text, provider: `mistral/${step.model}` };
         } catch (e) {
             console.error(`General-chat provider failed (${step.provider}/${step.model}):`, e.message);
             lastErr = e;
@@ -1032,6 +1045,12 @@ client.on('messageCreate', async (message) => {
                 choice = response.choices[0];
             }
             botReply = choice.message.content;
+            if (looksGarbled(botReply)) {
+                console.error('Mistral output looked garbled/mixed-script, retrying once.');
+                messages.push({ role: 'user', content: '(Câu trả lời trước bị lỗi hiển thị ký tự lạ. Hãy trả lời lại, chỉ dùng tiếng Việt/tiếng Anh bình thường.)' });
+                const retryResp = await mistral.chat.complete({ model: TEXT_MODEL, messages, maxTokens: isCode ? 1800 : 900 });
+                botReply = retryResp.choices[0].message.content || botReply;
+            }
             providerUsed = `mistral/${TEXT_MODEL}`;
         } else {
             const messages = [{ role: 'system', content: systemPrompt }, ...history, { role: 'user', content: cleanPrompt }];
