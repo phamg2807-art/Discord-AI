@@ -518,7 +518,18 @@ async function joinUserVoiceChannel(message) {
             selfDeaf: false, // we need to actually hear users in later steps
         });
 
-        await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
+        // DEBUG: log every state transition so we can see exactly where a failed
+        // connection stalls (e.g. stuck on "connecting" usually points to a
+        // blocked/restricted outbound UDP path on the host, which is common on
+        // free-tier PaaS hosts like Render's free plan).
+        connection.on('stateChange', (oldState, newState) => {
+            console.log(`Voice connection state: ${oldState.status} -> ${newState.status}`);
+        });
+        connection.on('error', (err) => {
+            console.error('Voice connection error event:', err.message);
+        });
+
+        await entersState(connection, VoiceConnectionStatus.Ready, 20_000); // longer timeout while debugging
         voiceConnections.set(message.guildId, connection);
 
         connection.on(VoiceConnectionStatus.Disconnected, () => {
@@ -529,7 +540,7 @@ async function joinUserVoiceChannel(message) {
         console.log(`✅ Joined voice channel "${voiceChannel.name}" in guild ${message.guildId}`);
         return { ok: true, result: `🔊 Joined **${voiceChannel.name}**!` };
     } catch (e) {
-        console.error('Voice join failed:', e.message);
+        console.error('Voice join failed:', e.message, e.stack);
         return { ok: false, result: `Couldn't join voice channel: ${e.message}` };
     }
 }
