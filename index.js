@@ -33,23 +33,44 @@ const client = new Client({
 const mistral = new Mistral({ apiKey: process.env.MISTRAL_API_KEY || '' });
 
 // ============================================================
-// 3. Config
+// 3. Config — MODEL JOB DIVISION
 // ============================================================
-const TEXT_MODEL = 'mistral-large-latest';       // code questions + admin/knowledge tool-calling
-// NOTE (fixed 2026-07-13): pixtral-large-latest was deprecated 2026-02-27 and replaced by
-// Mistral Medium 3.5 (API id mistral-medium-latest), which has vision folded in. Using the old
-// id here was silently breaking the Mistral fallback path for image analysis.
-const VISION_MODEL = 'mistral-medium-latest';     // vision fallback if OpenRouter is unavailable
+// Each job below is handled by a specific model/provider chain. This keeps
+// costs at $0 (all free tiers) while making sure the strongest available
+// free option handles each type of work:
+//
+//   JOB                          MODEL(S)                                  WHY
+//   ---------------------------  ----------------------------------------  --------------------------------
+//   General chat                 Groq llama-3.3-70b -> Groq gpt-oss-120b   fastest free option; Mistral Large
+//                                 -> Mistral Large (final safety net)       only kicks in if Groq is fully down
+//   Code questions                Mistral Large                            best free-tier code reasoning we have
+//   Admin tool-calling             Mistral Large                            needs reliable function-calling support
+//   Image / vision analysis       OpenRouter chain (3 named free vision     tries specific known-good free vision
+//                                 models, in order) -> Mistral Medium       models instead of trusting the
+//                                 (final safety net)                        "openrouter/free" auto-router alone,
+//                                                                            so it can't silently break when one
+//                                                                            slug gets renamed/retired
+//   Long-term fact extraction      Mistral Large (small JSON call)          structured-output task, doesn't need
+//                                                                            its own dedicated model
+//
+const TEXT_MODEL = 'mistral-large-latest';       // code questions + admin/knowledge tool-calling + fact extraction
+const VISION_MODEL = 'mistral-medium-latest';     // vision FINAL fallback, only used if every OpenRouter option fails
 const GROQ_MODEL_PRIMARY = 'llama-3.3-70b-versatile'; // general chat — fastest free option
 // NOTE: Groq announced (2026-06-17) that llama-3.3-70b-versatile / llama-3.1-8b-instant are being
 // sunset on the free/dev tier. openai/gpt-oss-120b is Groq's own recommended replacement, so it's
 // wired in as an automatic fallback below — no code change needed when the old model finally 404s.
 const GROQ_MODEL_FALLBACK = 'openai/gpt-oss-120b';
-// NOTE (fixed 2026-07-13): the old id (nvidia/nemotron-3-nano-omni-30b-a3b:free) was wrong/rotated
-// out and returning errors. "openrouter/free" is OpenRouter's own auto-router — it inspects the
-// request (sees image_url content here) and picks a currently-live free model that supports vision,
-// so this won't silently break again the next time a specific free model gets renamed or retired.
-const OPENROUTER_VISION_MODEL = 'openrouter/free'; // reads image/audio/video, auto-routes to a live free model
+
+// Ordered chain of free, vision-capable OpenRouter models, tried in sequence.
+// Each is a real, currently-free (as of July 2026) model confirmed to accept
+// image input. If a slug gets renamed/retired later, just add/replace an
+// entry here — the calling code doesn't need to change.
+const OPENROUTER_VISION_CHAIN = [
+    'google/gemma-4-31b-it:free',                       // strong general vision-language, 262K ctx, 140+ languages
+    'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free', // text+image+video+audio in one loop, 256K ctx
+    'google/gemma-4-26b-a4b-it:free',                   // efficient MoE, image + short video, 262K ctx
+];
+
 const HISTORY_LIMIT = 14;
 const FACT_LIMIT = 20;
 const RETRIEVAL_LIMIT = 4; // how many DB rows to pull into context per search
@@ -385,9 +406,10 @@ async function callOpenRouter(messages, { model, maxTokens = 900 } = {}) {
     return data;
 }
 
-// General conversational chat: fast free Groq primary, Groq's own recommended
-// replacement next, Mistral Large as the final safety net so the bot never
-// goes fully silent if both Groq models are down or renamed.
+// JOB: General conversational chat (no code, no admin, no images).
+// Chain: fast free Groq primary -> Groq's own recommended replacement ->
+// Mistral Large as the final safety net so the bot never goes fully silent
+// if both Groq models are down or renamed.
 async function getGeneralChatReply(messages) {
     const chain = [
         { provider: 'groq', model: GROQ_MODEL_PRIMARY },
@@ -415,28 +437,42 @@ async function getGeneralChatReply(messages) {
     throw lastErr || new Error('All general-chat providers failed');
 }
 
-// Vision: OpenRouter's free auto-router primary (also handles audio/video),
-// Mistral Pixtral/Medium as fallback (proven working already).
+// JOB: Image / vision analysis. Walks OPENROUTER_VISION_CHAIN in order —
+// each entry is a specific, currently-free, confirmed vision-capable model
+// (not the "openrouter/free" auto-router, so behavior doesn't shift under us
+// if the auto-router's pick changes). Mistral Medium is the final safety net
+// if every OpenRouter option fails or is rate-limited.
 async function getVisionReply(systemPrompt, history, cleanPrompt, imageUrls) {
     const promptText = cleanPrompt || 'Please describe and analyze this image (or images).';
-    try {
-        const messages = [
-            { role: 'system', content: systemPrompt },
-            ...history,
-            {
-                role: 'user',
-                content: [
-                    { type: 'text', text: promptText },
-                    ...imageUrls.map((url) => ({ type: 'image_url', image_url: { url } })),
-                ],
-            },
-        ];
-        const data = await callOpenRouter(messages, { model: OPENROUTER_VISION_MODEL, maxTokens: 900 });
-        return { text: data.choices[0].message.content, provider: `openrouter/${OPENROUTER_VISION_MODEL}` };
-    } catch (e) {
-        console.error('OpenRouter vision failed, falling back to Mistral:', e.message);
+
+    const openRouterMessages = [
+        { role: 'system', content: systemPrompt },
+        ...history,
+        {
+            role: 'user',
+            content: [
+                { type: 'text', text: promptText },
+                ...imageUrls.map((url) => ({ type: 'image_url', image_url: { url } })),
+            ],
+        },
+    ];
+
+    let lastErr;
+    for (const model of OPENROUTER_VISION_CHAIN) {
+        try {
+            const data = await callOpenRouter(openRouterMessages, { model, maxTokens: 900 });
+            const text = data.choices[0].message.content;
+            if (looksGarbled(text)) throw new Error(`Output looked garbled/mixed-script from ${model}, trying next model`);
+            if (!text || !text.trim()) throw new Error(`Empty response from ${model}, trying next model`);
+            return { text, provider: `openrouter/${model}` };
+        } catch (e) {
+            console.error(`Vision model failed (openrouter/${model}):`, e.message);
+            lastErr = e;
+        }
     }
-    const messages = [
+
+    console.error('All OpenRouter vision models failed, falling back to Mistral:', lastErr?.message);
+    const mistralMessages = [
         { role: 'system', content: systemPrompt },
         ...history,
         {
@@ -447,7 +483,7 @@ async function getVisionReply(systemPrompt, history, cleanPrompt, imageUrls) {
             ],
         },
     ];
-    const resp = await mistral.chat.complete({ model: VISION_MODEL, messages, maxTokens: 900 });
+    const resp = await mistral.chat.complete({ model: VISION_MODEL, messages: mistralMessages, maxTokens: 900 });
     return { text: resp.choices[0].message.content, provider: `mistral/${VISION_MODEL}` };
 }
 
@@ -1086,6 +1122,12 @@ client.on('messageCreate', async (message) => {
         let botReply;
         let providerUsed;
 
+        // --------------------------------------------------------
+        // JOB ROUTING: pick which model handles this message.
+        //   images          -> getVisionReply()      (OpenRouter chain -> Mistral)
+        //   admin or code   -> Mistral Large + tools  (tool-calling / code reasoning)
+        //   everything else -> getGeneralChatReply()  (Groq chain -> Mistral)
+        // --------------------------------------------------------
         if (hasImages) {
             const result = await getVisionReply(systemPrompt, history, cleanPrompt, imageUrls);
             botReply = result.text;
