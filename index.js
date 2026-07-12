@@ -658,6 +658,48 @@ function findChannel(guild, name) {
     return guild.channels.cache.find((c) => c.name.toLowerCase() === q || c.name.toLowerCase().includes(q));
 }
 
+// Creates (or reuses) a personal AI-chat channel for a user: everyone in the server can SEE it
+// and read the conversation, but only that user (+ the bot) can actually send messages in it.
+async function createOrGetPrivateChatChannel(guild, member) {
+    const slug = member.user.username.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 20) || member.id;
+    const channelName = `ai-chat-${slug}`;
+    const existing = guild.channels.cache.find(
+        (c) => c.type === ChannelType.GuildText && c.name === channelName && c.topic === `private-ai-chat:${member.id}`
+    );
+    if (existing) return { channel: existing, created: false };
+
+    const channel = await guild.channels.create({
+        name: channelName,
+        type: ChannelType.GuildText,
+        topic: `private-ai-chat:${member.id}`,
+        permissionOverwrites: [
+            {
+                id: guild.roles.everyone.id,
+                allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.ReadMessageHistory],
+                deny: [PermissionsBitField.Flags.SendMessages],
+            },
+            {
+                id: member.id,
+                allow: [
+                    PermissionsBitField.Flags.ViewChannel,
+                    PermissionsBitField.Flags.ReadMessageHistory,
+                    PermissionsBitField.Flags.SendMessages,
+                ],
+            },
+            {
+                id: guild.members.me.id,
+                allow: [
+                    PermissionsBitField.Flags.ViewChannel,
+                    PermissionsBitField.Flags.ReadMessageHistory,
+                    PermissionsBitField.Flags.SendMessages,
+                    PermissionsBitField.Flags.ManageChannels,
+                ],
+            },
+        ],
+    });
+    return { channel, created: true };
+}
+
 // ============================================================
 // 9. Tool execution — the actual side effects (Discord.js + DB)
 // ============================================================
