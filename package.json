@@ -1,0 +1,13 @@
+{
+  "name": "sjp-ai-assistant",
+  "version": "1.0.0",
+  "description": "Discord Bot driven by Mistral AI",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@mistralai/mistralai": "^2.4.1",
+    "discord.js": "^14.14.1"
+  }
+}
