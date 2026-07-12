@@ -55,18 +55,26 @@ const FACT_LIMIT = 20;
 const RETRIEVAL_LIMIT = 4; // how many DB rows to pull into context per search
 const PREFIX = '-'; // command prefix for all "-" commands
 const DATA_FILE = path.join(__dirname, 'memory.json');
+
+// Default persona: English is the main language. The bot only switches to
+// another language for a given exchange if the user actually writes to it
+// in that language — it doesn't guess based on server default or past turns.
 const DEFAULT_PERSONA =
-    'Bạn là một trợ lý AI thông minh, thân thiện, thích ứng theo từng máy chủ và từng người dùng. ' +
-    'Trả lời ngắn gọn, tự nhiên, đúng trọng tâm. Khi người dùng gửi ảnh, hãy mô tả/phân tích ảnh đó. ' +
-    'Khi người dùng gửi code, hãy đọc kỹ, giải thích rõ ràng và trả code trong khối markdown (```lang). ' +
-    'Nếu người dùng là Admin và yêu cầu quản lý server (tạo/xoá/đổi tên kênh, quản lý vai trò, kick/timeout), ' +
-    'hãy dùng công cụ (tool) tương ứng thay vì chỉ mô tả cách làm. ' +
-    'Nếu câu hỏi của người dùng chưa đủ rõ, hoặc biết thêm về sở thích/công việc/dự án của họ sẽ giúp bạn trả lời tốt hơn ' +
-    'sau này, hãy chủ động hỏi lại một cách tự nhiên (đừng hỏi dồn dập, tối đa một câu hỏi mỗi lượt). ' +
-    'Khi người dùng chia sẻ điều gì đó lâu dài và hữu ích về bản thân, hãy ghi nhớ nó bằng công cụ remember_fact. ' +
-    'Trước khi trả lời điều gì đó có thể đã được lưu trước đây, hãy cân nhắc dùng công cụ search_knowledge để kiểm tra. ' +
-    'Luôn trả lời bằng tiếng Việt tự nhiên (hoặc tiếng Anh nếu người dùng nhắn bằng tiếng Anh) — không chèn chữ cái ' +
-    'từ hệ chữ khác (như tiếng Nga, tiếng Trung...) trừ khi người dùng thực sự yêu cầu.';
+    'You are a smart, friendly AI assistant that adapts per-server and per-user. ' +
+    'Reply concisely, naturally, and on-point. When a user sends an image, describe/analyze it. ' +
+    'When a user sends code, read it carefully, explain clearly, and return code in a markdown block (```lang). ' +
+    'LANGUAGE RULE: Default to natural, fluent English. If a user writes to you in a different language, ' +
+    'reply in that same language for that exchange instead. Never mix unrelated scripts/languages into a ' +
+    'single reply unless the user explicitly asks for a translation. ' +
+    'If the user is an Admin and asks you to manage the server (create/delete/rename channels, manage roles, ' +
+    'kick/timeout), use the matching tool instead of just describing how to do it. ' +
+    "If the user's request is unclear, or if learning more about their interests/work/projects would help you " +
+    'answer better in the future, feel free to ask a natural follow-up question (don\'t interrogate them — at ' +
+    'most one question per turn). ' +
+    'When a user shares something durable and useful about themselves, remember it using the remember_fact tool. ' +
+    'Before answering something that might have been saved before, consider using the search_knowledge tool to check. ' +
+    'If the user is replying to one of your previous messages, or the message includes a note about what they\'re ' +
+    'replying to, treat that as important context for what "it"/"that"/"this" refers to.';
 
 // ============================================================
 // 4. Supabase — long-term knowledge database
@@ -231,11 +239,11 @@ async function learnAndStore(userId, guildId, isAdmin, recentUserText, recentHis
         // single latest line — a lot of useful signal (who someone is, an ongoing project,
         // a stated opinion/relationship) only makes sense with a turn or two of context.
         const contextWindow = (recentHistory || []).slice(-6)
-            .map((m) => `${m.role === 'user' ? 'Người dùng' : 'Bot'}: ${m.content}`)
+            .map((m) => `${m.role === 'user' ? 'User' : 'Bot'}: ${m.content}`)
             .join('\n');
         const transcript = contextWindow
-            ? `Đoạn hội thoại gần đây:\n${contextWindow}\n\nTin nhắn mới nhất của người dùng: ${recentUserText}`
-            : `Tin nhắn của người dùng: ${recentUserText}`;
+            ? `Recent conversation:\n${contextWindow}\n\nUser's latest message: ${recentUserText}`
+            : `User's message: ${recentUserText}`;
 
         const resp = await mistral.chat.complete({
             model: TEXT_MODEL,
@@ -243,18 +251,19 @@ async function learnAndStore(userId, guildId, isAdmin, recentUserText, recentHis
                 {
                     role: 'system',
                     content:
-                        'Bạn đọc đoạn hội thoại dưới đây và quyết định có gì đáng nhớ LÂU DÀI về người dùng hay không. ' +
-                        'Hãy rộng rãi một chút — không chỉ thông tin họ "khai báo" trực tiếp, mà cả những gì suy ra được ' +
-                        'một cách hợp lý: sở thích, công việc, dự án đang làm, mục tiêu, mối quan hệ hoặc quan điểm của họ ' +
-                        'về người/việc cụ thể, thói quen, hoàn cảnh... Nếu người dùng nhắc tới một người/sự việc cụ thể ' +
-                        'kèm quan điểm hay cảm xúc rõ ràng (vd: ghét, thích, tin tưởng, mâu thuẫn với ai đó), đó CŨNG đáng ghi nhớ. ' +
-                        'CHỈ bỏ qua lời chào hỏi thuần tuý, câu hỏi kỹ thuật nhất thời, hoặc câu nói không mang thông tin gì. ' +
-                        'Nếu tin nhắn là quy định/thông tin chung áp dụng cho cả server (không chỉ riêng người này), ' +
-                        'đưa vào "guild_knowledge" thay vì "user_facts". ' +
-                        'Viết mỗi mục ngắn gọn, ở ngôi thứ ba (vd: "Không thích một người tên Kenkai vì cho rằng anh ta ảo tưởng"). ' +
-                        'CHỈ trả về JSON đúng định dạng: ' +
+                        'Read the conversation below and decide if there is anything worth remembering LONG-TERM ' +
+                        'about the user. Be reasonably generous — not just things they stated directly, but anything ' +
+                        'reasonably inferable: interests, job, ongoing projects, goals, relationships or opinions about ' +
+                        'specific people/things, habits, circumstances... If the user mentions a specific person/event ' +
+                        'with a clear opinion or emotion (e.g. dislikes, likes, trusts, conflicts with someone), that is ' +
+                        'ALSO worth remembering. ONLY skip pure greetings, one-off technical questions, or messages that ' +
+                        "carry no real information. If the message is a rule/info that applies to the whole server " +
+                        '(not just this person), put it under "guild_knowledge" instead of "user_facts". ' +
+                        'Write each item concisely, in third person (e.g. "Dislikes someone named Kenkai for being full ' +
+                        'of himself"). ' +
+                        'Return ONLY JSON in this exact format: ' +
                         '{"user_facts": ["..."], "guild_knowledge": [{"topic": "...", "content": "..."}]}. ' +
-                        'Nếu thực sự không có gì đáng nhớ, trả {"user_facts": [], "guild_knowledge": []}.',
+                        'If there is truly nothing worth remembering, return {"user_facts": [], "guild_knowledge": []}.',
                 },
                 { role: 'user', content: transcript },
             ],
@@ -295,17 +304,17 @@ async function buildSystemPrompt(guildId, userId, isAdmin, retrievedFacts, retri
 
     const facts = await dbListUserFacts(userId, FACT_LIMIT);
     if (facts.length) {
-        sys += `\n\nNhững điều bạn đã biết về người dùng này (dùng tự nhiên, đừng liệt kê máy móc):\n- ${facts.map((f) => f.fact).join('\n- ')}`;
+        sys += `\n\nThings you already know about this user (use naturally, don't just list them out):\n- ${facts.map((f) => f.fact).join('\n- ')}`;
     }
     if (retrievedFacts && retrievedFacts.length) {
-        sys += `\n\nThông tin liên quan tìm thấy về người dùng này khi tra cứu câu hỏi hiện tại:\n- ${retrievedFacts.map((f) => f.fact).join('\n- ')}`;
+        sys += `\n\nRelevant info found about this user while looking up the current question:\n- ${retrievedFacts.map((f) => f.fact).join('\n- ')}`;
     }
     if (retrievedKnowledge && retrievedKnowledge.length) {
-        sys += `\n\nKiến thức liên quan tìm thấy trong cơ sở dữ liệu của server (chỉ dùng nếu thực sự liên quan, đừng bịa thêm nếu không chắc):\n- ${retrievedKnowledge.map((k) => `${k.topic ? k.topic + ': ' : ''}${k.content}`).join('\n- ')}`;
+        sys += `\n\nRelevant knowledge found in this server's database (only use if actually relevant, don't make things up if unsure):\n- ${retrievedKnowledge.map((k) => `${k.topic ? k.topic + ': ' : ''}${k.content}`).join('\n- ')}`;
     }
     sys += isAdmin
-        ? '\n\nNgười đang nhắn tin là Admin của server này, được phép dùng mọi công cụ quản trị.'
-        : '\n\nNgười đang nhắn tin KHÔNG phải Admin — nếu họ yêu cầu hành động quản trị, hãy giải thích rằng chỉ Admin mới có thể làm việc đó, đừng gọi tool.';
+        ? '\n\nThe person messaging you is an Admin of this server, allowed to use any admin tool.'
+        : '\n\nThe person messaging you is NOT an Admin — if they ask for an admin action, explain that only an Admin can do that, and do not call the tool.';
     return sys;
 }
 function looksLikeCode(text) {
@@ -313,7 +322,7 @@ function looksLikeCode(text) {
 }
 // Occasionally a small/free model (especially under hostile or heavily-profane input) degrades
 // into blending in stray characters from an unrelated script (e.g. Cyrillic mid-word: "конструktive").
-// Vietnamese/English text should never legitimately contain Cyrillic, so treat its presence as a
+// A reply should never legitimately mix in an unrelated script like this, so treat its presence as a
 // sign the generation glitched and should be retried on a different provider/model.
 function looksGarbled(text) {
     return /[\u0400-\u04FF]/.test(text || '');
@@ -324,6 +333,20 @@ async function collectImageUrls(message) {
         if (att.contentType && att.contentType.startsWith('image/')) urls.push(att.url);
     }
     return urls;
+}
+
+// Fetches the message this one is replying to, IF that message was sent by
+// the bot itself. Used so the AI knows what "that"/"it"/"this" refers to
+// when a user replies directly to one of the bot's previous answers.
+async function getRepliedToBotMessage(message) {
+    if (!message.reference?.messageId) return null;
+    try {
+        const ref = await message.channel.messages.fetch(message.reference.messageId);
+        if (ref.author.id === client.user.id) return ref;
+    } catch (e) {
+        // Message may have been deleted or is otherwise unfetchable — just ignore.
+    }
+    return null;
 }
 
 // ============================================================
@@ -392,10 +415,10 @@ async function getGeneralChatReply(messages) {
     throw lastErr || new Error('All general-chat providers failed');
 }
 
-// Vision: OpenRouter's Nemotron 3 Nano Omni primary (confirmed free, also
-// handles audio/video), Mistral Pixtral as fallback (proven working already).
+// Vision: OpenRouter's free auto-router primary (also handles audio/video),
+// Mistral Pixtral/Medium as fallback (proven working already).
 async function getVisionReply(systemPrompt, history, cleanPrompt, imageUrls) {
-    const promptText = cleanPrompt || 'Hãy mô tả và phân tích (các) hình ảnh này.';
+    const promptText = cleanPrompt || 'Please describe and analyze this image (or images).';
     try {
         const messages = [
             { role: 'system', content: systemPrompt },
@@ -411,7 +434,7 @@ async function getVisionReply(systemPrompt, history, cleanPrompt, imageUrls) {
         const data = await callOpenRouter(messages, { model: OPENROUTER_VISION_MODEL, maxTokens: 900 });
         return { text: data.choices[0].message.content, provider: `openrouter/${OPENROUTER_VISION_MODEL}` };
     } catch (e) {
-        console.error('OpenRouter vision failed, falling back to Mistral Pixtral:', e.message);
+        console.error('OpenRouter vision failed, falling back to Mistral:', e.message);
     }
     const messages = [
         { role: 'system', content: systemPrompt },
@@ -712,23 +735,23 @@ async function executeTool(ctx, name, args) {
                 dbSearchUserFacts(ctx.userId, args.query),
                 dbSearchKnowledge(ctx.guildId, args.query),
             ]);
-            if (!dbEnabled()) return { ok: false, result: 'Cơ sở dữ liệu kiến thức chưa được cấu hình.' };
-            if (!facts.length && !knowledge.length) return { ok: true, result: 'Không tìm thấy gì liên quan trong cơ sở dữ liệu.' };
+            if (!dbEnabled()) return { ok: false, result: 'The knowledge database is not configured yet.' };
+            if (!facts.length && !knowledge.length) return { ok: true, result: 'Nothing relevant found in the database.' };
             const lines = [];
-            if (facts.length) lines.push('Thông tin về người dùng:\n' + facts.map((f) => `- ${f.fact}`).join('\n'));
-            if (knowledge.length) lines.push('Kiến thức server:\n' + knowledge.map((k) => `- ${k.topic ? k.topic + ': ' : ''}${k.content}`).join('\n'));
+            if (facts.length) lines.push('About this user:\n' + facts.map((f) => `- ${f.fact}`).join('\n'));
+            if (knowledge.length) lines.push('Server knowledge:\n' + knowledge.map((k) => `- ${k.topic ? k.topic + ': ' : ''}${k.content}`).join('\n'));
             return { ok: true, result: lines.join('\n\n') };
         }
         case 'remember_fact': {
-            if (!dbEnabled()) return { ok: false, result: 'Cơ sở dữ liệu kiến thức chưa được cấu hình.' };
-            if (!args.content) return { ok: false, result: 'Thiếu nội dung cần ghi nhớ.' };
+            if (!dbEnabled()) return { ok: false, result: 'The knowledge database is not configured yet.' };
+            if (!args.content) return { ok: false, result: 'Missing content to remember.' };
             if (args.scope === 'guild') {
-                if (!ctx.isAdmin) return { ok: false, result: 'Chỉ Admin mới có thể lưu kiến thức chung cho cả server.' };
+                if (!ctx.isAdmin) return { ok: false, result: 'Only an Admin can save shared server knowledge.' };
                 await dbAddKnowledge(ctx.guildId, args.topic, args.content, ctx.userId);
-                return { ok: true, result: `Đã lưu kiến thức chung cho server: "${args.content}".` };
+                return { ok: true, result: `Saved shared server knowledge: "${args.content}".` };
             }
             await dbAddUserFact(ctx.userId, ctx.guildId, args.content);
-            return { ok: true, result: `Đã ghi nhớ về bạn: "${args.content}".` };
+            return { ok: true, result: `Remembered about you: "${args.content}".` };
         }
         // ---- admin tools ----
         case 'list_channels': {
@@ -737,18 +760,18 @@ async function executeTool(ctx, name, args) {
             const lines = [];
             for (const cat of cats.values()) {
                 const children = guild.channels.cache.filter((c) => c.parentId === cat.id);
-                lines.push(`📁 ${cat.name}: ${children.map((c) => c.name).join(', ') || '(trống)'}`);
+                lines.push(`📁 ${cat.name}: ${children.map((c) => c.name).join(', ') || '(empty)'}`);
             }
             const uncategorized = guild.channels.cache.filter((c) => !c.parentId && c.type !== ChannelType.GuildCategory);
-            if (uncategorized.size) lines.push(`(không danh mục): ${uncategorized.map((c) => c.name).join(', ')}`);
-            return { ok: true, result: lines.join('\n') || 'Server chưa có kênh nào.' };
+            if (uncategorized.size) lines.push(`(uncategorized): ${uncategorized.map((c) => c.name).join(', ')}`);
+            return { ok: true, result: lines.join('\n') || 'This server has no channels yet.' };
         }
         case 'find_user': {
             const member = findMember(ctx.guild, args.query);
-            if (!member) return { ok: false, result: `Không tìm thấy người dùng khớp với "${args.query}".` };
+            if (!member) return { ok: false, result: `No user found matching "${args.query}".` };
             return {
                 ok: true,
-                result: `${member.user.tag} (nickname: ${member.nickname || 'không có'}), vai trò: ${member.roles.cache.map((r) => r.name).join(', ')}`,
+                result: `${member.user.tag} (nickname: ${member.nickname || 'none'}), roles: ${member.roles.cache.map((r) => r.name).join(', ')}`,
             };
         }
         case 'create_channel': {
@@ -759,26 +782,26 @@ async function executeTool(ctx, name, args) {
                 if (cat && cat.type === ChannelType.GuildCategory) opts.parent = cat.id;
             }
             const created = await ctx.guild.channels.create(opts);
-            return { ok: true, result: `Đã tạo kênh #${created.name}.` };
+            return { ok: true, result: `Created channel #${created.name}.` };
         }
         case 'delete_channel': {
             const ch = findChannel(ctx.guild, args.channel_name);
-            if (!ch) return { ok: false, result: `Không tìm thấy kênh "${args.channel_name}".` };
+            if (!ch) return { ok: false, result: `Could not find channel "${args.channel_name}".` };
             const chName = ch.name;
             await ch.delete();
-            return { ok: true, result: `Đã xoá kênh #${chName}.` };
+            return { ok: true, result: `Deleted channel #${chName}.` };
         }
         case 'rename_channel': {
             const ch = findChannel(ctx.guild, args.old_name);
-            if (!ch) return { ok: false, result: `Không tìm thấy kênh "${args.old_name}".` };
+            if (!ch) return { ok: false, result: `Could not find channel "${args.old_name}".` };
             await ch.setName(args.new_name);
-            return { ok: true, result: `Đã đổi tên kênh thành #${args.new_name}.` };
+            return { ok: true, result: `Renamed channel to #${args.new_name}.` };
         }
         case 'set_channel_topic': {
             const ch = findChannel(ctx.guild, args.channel_name);
-            if (!ch || !('setTopic' in ch)) return { ok: false, result: `Không tìm thấy kênh văn bản "${args.channel_name}".` };
+            if (!ch || !('setTopic' in ch)) return { ok: false, result: `Could not find text channel "${args.channel_name}".` };
             await ch.setTopic(args.topic);
-            return { ok: true, result: `Đã cập nhật chủ đề cho #${ch.name}.` };
+            return { ok: true, result: `Updated topic for #${ch.name}.` };
         }
         case 'create_role': {
             const role = await ctx.guild.roles.create({
@@ -786,49 +809,49 @@ async function executeTool(ctx, name, args) {
                 color: args.color || undefined,
                 mentionable: !!args.mentionable,
             });
-            return { ok: true, result: `Đã tạo vai trò "${role.name}".` };
+            return { ok: true, result: `Created role "${role.name}".` };
         }
         case 'assign_role': {
             const member = findMember(ctx.guild, args.user_query);
             const role = findRole(ctx.guild, args.role_name);
-            if (!member) return { ok: false, result: `Không tìm thấy người dùng "${args.user_query}".` };
-            if (!role) return { ok: false, result: `Không tìm thấy vai trò "${args.role_name}".` };
+            if (!member) return { ok: false, result: `Could not find user "${args.user_query}".` };
+            if (!role) return { ok: false, result: `Could not find role "${args.role_name}".` };
             await member.roles.add(role);
-            return { ok: true, result: `Đã gán vai trò "${role.name}" cho ${member.user.tag}.` };
+            return { ok: true, result: `Assigned role "${role.name}" to ${member.user.tag}.` };
         }
         case 'remove_role': {
             const member = findMember(ctx.guild, args.user_query);
             const role = findRole(ctx.guild, args.role_name);
-            if (!member) return { ok: false, result: `Không tìm thấy người dùng "${args.user_query}".` };
-            if (!role) return { ok: false, result: `Không tìm thấy vai trò "${args.role_name}".` };
+            if (!member) return { ok: false, result: `Could not find user "${args.user_query}".` };
+            if (!role) return { ok: false, result: `Could not find role "${args.role_name}".` };
             await member.roles.remove(role);
-            return { ok: true, result: `Đã gỡ vai trò "${role.name}" khỏi ${member.user.tag}.` };
+            return { ok: true, result: `Removed role "${role.name}" from ${member.user.tag}.` };
         }
         case 'kick_user': {
             const member = findMember(ctx.guild, args.user_query);
-            if (!member) return { ok: false, result: `Không tìm thấy người dùng "${args.user_query}".` };
-            if (!member.kickable) return { ok: false, result: `Tôi không có quyền kick ${member.user.tag} (vai trò của họ cao hơn bot).` };
+            if (!member) return { ok: false, result: `Could not find user "${args.user_query}".` };
+            if (!member.kickable) return { ok: false, result: `I don't have permission to kick ${member.user.tag} (their role is higher than mine).` };
             const tag = member.user.tag;
-            await member.kick(args.reason || 'Không có lý do cụ thể');
-            return { ok: true, result: `Đã kick ${tag}.` };
+            await member.kick(args.reason || 'No specific reason given');
+            return { ok: true, result: `Kicked ${tag}.` };
         }
         case 'timeout_user': {
             const member = findMember(ctx.guild, args.user_query);
-            if (!member) return { ok: false, result: `Không tìm thấy người dùng "${args.user_query}".` };
+            if (!member) return { ok: false, result: `Could not find user "${args.user_query}".` };
             const ms = Math.min(Math.max(args.minutes, 1), 40320) * 60 * 1000;
-            await member.timeout(ms, args.reason || 'Không có lý do cụ thể');
-            return { ok: true, result: `Đã timeout ${member.user.tag} trong ${args.minutes} phút.` };
+            await member.timeout(ms, args.reason || 'No specific reason given');
+            return { ok: true, result: `Timed out ${member.user.tag} for ${args.minutes} minutes.` };
         }
         case 'ban_user': {
             const member = findMember(ctx.guild, args.user_query);
-            if (!member) return { ok: false, result: `Không tìm thấy người dùng "${args.user_query}".` };
-            if (!member.bannable) return { ok: false, result: `Tôi không có quyền ban ${member.user.tag}.` };
+            if (!member) return { ok: false, result: `Could not find user "${args.user_query}".` };
+            if (!member.bannable) return { ok: false, result: `I don't have permission to ban ${member.user.tag}.` };
             const tag = member.user.tag;
-            await member.ban({ reason: args.reason || 'Không có lý do cụ thể' });
-            return { ok: true, result: `Đã ban ${tag}.` };
+            await member.ban({ reason: args.reason || 'No specific reason given' });
+            return { ok: true, result: `Banned ${tag}.` };
         }
         default:
-            return { ok: false, result: `Không rõ công cụ "${name}".` };
+            return { ok: false, result: `Unknown tool "${name}".` };
     }
 }
 
@@ -836,40 +859,43 @@ async function executeTool(ctx, name, args) {
 // 10. "-" prefix commands (bot + AI knowledge management)
 // ============================================================
 const HELP_TEXT = [
-    '**Lệnh chung**',
-    `\`${PREFIX}help\` — hiện danh sách lệnh này`,
-    `\`${PREFIX}ping\` — kiểm tra độ trễ của bot`,
-    `\`${PREFIX}stats\` — thống kê nhanh`,
+    '**General commands**',
+    `\`${PREFIX}help\` — show this command list`,
+    `\`${PREFIX}ping\` — check bot latency`,
+    `\`${PREFIX}stats\` — quick stats`,
     '',
     '**Persona (Admin)**',
-    `\`${PREFIX}persona <mô tả>\` — đổi giọng/persona AI cho server này`,
-    `\`${PREFIX}resetpersona\` — đặt lại persona mặc định`,
+    `\`${PREFIX}persona <description>\` — change the AI's tone/persona for this server`,
+    `\`${PREFIX}resetpersona\` — reset to the default persona`,
     '',
-    '**Trí nhớ cá nhân (AI học về bạn)**',
-    `\`${PREFIX}whatyouknow\` — xem những gì bot nhớ về bạn`,
-    `\`${PREFIX}remember <điều cần nhớ>\` — tự tay yêu cầu bot ghi nhớ điều gì đó`,
-    `\`${PREFIX}forget <id>\` — quên một điều cụ thể (id lấy từ whatyouknow)`,
-    `\`${PREFIX}forgetme\` — xoá toàn bộ những gì bot nhớ về bạn`,
+    '**Personal memory (AI learns about you)**',
+    `\`${PREFIX}whatyouknow\` — see what the bot remembers about you`,
+    `\`${PREFIX}remember <thing to remember>\` — manually tell the bot to remember something`,
+    `\`${PREFIX}forget <id>\` — forget one specific thing (id comes from whatyouknow)`,
+    `\`${PREFIX}forgetme\` — erase everything the bot remembers about you`,
     '',
-    '**Kiến thức chung của server (Admin)**',
-    `\`${PREFIX}know <chủ đề> | <nội dung>\` — lưu một kiến thức dùng chung cho cả server`,
-    `\`${PREFIX}knowledge\` — liệt kê kiến thức đã lưu cho server`,
-    `\`${PREFIX}forgetknowledge <id>\` — xoá một mục kiến thức server`,
+    '**Shared server knowledge (Admin)**',
+    `\`${PREFIX}know <topic> | <content>\` — save a piece of knowledge shared by the whole server`,
+    `\`${PREFIX}knowledge\` — list knowledge saved for this server`,
+    `\`${PREFIX}forgetknowledge <id>\` — remove a server knowledge entry`,
     '',
-    '**Tra cứu**',
-    `\`${PREFIX}search <từ khoá>\` — tìm trong trí nhớ cá nhân + kiến thức server`,
+    '**Lookup**',
+    `\`${PREFIX}search <keywords>\` — search personal memory + server knowledge`,
     '',
-    `Ngoài ra, hãy **mention bot** (\`@tên_bot\`) kèm câu hỏi để trò chuyện với AI bất cứ lúc nào.`,
+    '**Private AI channel**',
+    `\`${PREFIX}aichat\` — create (or open) your own private chat channel with the AI. Everyone can see it, but only you can type there`,
+    '',
+    `You can also **mention the bot** (\`@SjpHelper\`) or **reply to one of its messages** with a question, any time.`,
 ].join('\n');
 
 function requireAdmin(message) {
     const isAdmin = message.member?.permissions.has(PermissionsBitField.Flags.Administrator) ?? false;
-    if (!isAdmin) message.reply('⛔ Lệnh này chỉ dành cho Admin.');
+    if (!isAdmin) message.reply('⛔ This command is Admin-only.');
     return isAdmin;
 }
 function requireDb(message) {
     if (!dbEnabled()) {
-        message.reply('⚠️ Cơ sở dữ liệu kiến thức chưa được cấu hình. Xem `SUPABASE_SETUP.md` để thiết lập Supabase.');
+        message.reply('⚠️ The knowledge database is not configured yet. See `SUPABASE_SETUP.md` to set up Supabase.');
         return false;
     }
     return true;
@@ -883,106 +909,115 @@ async function handleSlashLikeCommand(message) {
 
     switch (cmd) {
         case 'help': {
-            const embed = new EmbedBuilder().setTitle('🤖 Danh sách lệnh').setDescription(HELP_TEXT).setColor(0x5865f2);
+            const embed = new EmbedBuilder().setTitle('🤖 Command list').setDescription(HELP_TEXT).setColor(0x5865f2);
             return message.reply({ embeds: [embed] });
         }
         case 'ping': {
-            const sent = await message.reply('🏓 Đang đo...');
+            const sent = await message.reply('🏓 Measuring...');
             const latency = sent.createdTimestamp - message.createdTimestamp;
-            return sent.edit(`🏓 Pong! Độ trễ tin nhắn: ${latency}ms · Ping API: ${Math.round(client.ws.ping)}ms`);
+            return sent.edit(`🏓 Pong! Message latency: ${latency}ms · API ping: ${Math.round(client.ws.ping)}ms`);
         }
         case 'stats': {
             const uptimeSec = Math.floor(process.uptime());
             const h = Math.floor(uptimeSec / 3600), m = Math.floor((uptimeSec % 3600) / 60);
             return message.reply(
-                `📊 **Thống kê bot**\n` +
-                `- Server đang phục vụ: ${client.guilds.cache.size}\n` +
-                `- Thời gian hoạt động: ${h}h ${m}m\n` +
-                `- Cơ sở dữ liệu kiến thức: ${dbEnabled() ? '✅ Đã kết nối' : '❌ Chưa cấu hình'}`
+                `📊 **Bot stats**\n` +
+                `- Servers served: ${client.guilds.cache.size}\n` +
+                `- Uptime: ${h}h ${m}m\n` +
+                `- Knowledge database: ${dbEnabled() ? '✅ Connected' : '❌ Not configured'}`
             );
         }
         case 'persona': {
             if (!requireAdmin(message)) return;
-            if (!rest) return message.reply(`Hãy nhập mô tả persona sau lệnh, ví dụ: \`${PREFIX}persona Bạn là một hải tặc dí dỏm\`.`);
+            if (!rest) return message.reply(`Enter a persona description after the command, e.g. \`${PREFIX}persona You are a witty pirate\`.`);
             getGuild(message.guildId).persona = rest;
             saveStoreSoon();
-            return message.reply(`✅ Đã đổi giọng/persona của tôi cho server này thành:\n> ${rest}`);
+            return message.reply(`✅ Changed my tone/persona for this server to:\n> ${rest}`);
         }
         case 'resetpersona': {
             if (!requireAdmin(message)) return;
             getGuild(message.guildId).persona = DEFAULT_PERSONA;
             saveStoreSoon();
-            return message.reply('✅ Đã đặt lại persona mặc định cho server này.');
+            return message.reply('✅ Reset to the default persona for this server.');
         }
         case 'whatyouknow': {
             if (!requireDb(message)) return;
             const facts = await dbListUserFacts(message.author.id);
-            if (!facts.length) return message.reply('Tôi chưa học được điều gì đặc biệt về bạn cả!');
+            if (!facts.length) return message.reply("I haven't learned anything special about you yet!");
             const lines = facts.map((f) => `\`${f.id.slice(0, 8)}\` — ${f.fact}`).join('\n');
-            return message.reply(`Đây là những gì tôi nhớ về bạn:\n${lines}`);
+            return message.reply(`Here's what I remember about you:\n${lines}`);
         }
         case 'remember': {
             if (!requireDb(message)) return;
-            if (!rest) return message.reply(`Hãy nhập điều cần nhớ, ví dụ: \`${PREFIX}remember Mình thích lập trình Fabric mod\`.`);
+            if (!rest) return message.reply(`Enter what to remember, e.g. \`${PREFIX}remember I like modding Fabric\`.`);
             await dbAddUserFact(message.author.id, message.guildId, rest);
-            return message.reply(`✅ Đã ghi nhớ: "${rest}"`);
+            return message.reply(`✅ Remembered: "${rest}"`);
         }
         case 'forget': {
             if (!requireDb(message)) return;
-            if (!rest) return message.reply(`Hãy nhập id cần quên (xem qua \`${PREFIX}whatyouknow\`).`);
+            if (!rest) return message.reply(`Enter the id to forget (check \`${PREFIX}whatyouknow\`).`);
             const facts = await dbListUserFacts(message.author.id, 100);
             const match = facts.find((f) => f.id.startsWith(rest));
-            if (!match) return message.reply('Không tìm thấy điều đó trong trí nhớ của bạn.');
+            if (!match) return message.reply("Couldn't find that in your memory.");
             await dbDeleteUserFact(match.id, message.author.id);
-            return message.reply(`🧹 Đã quên: "${match.fact}"`);
+            return message.reply(`🧹 Forgot: "${match.fact}"`);
         }
         case 'forgetme': {
             if (!requireDb(message)) return;
             await dbClearUserFacts(message.author.id);
-            return message.reply('🧹 Đã xoá toàn bộ thông tin tôi học được về bạn.');
+            return message.reply('🧹 Erased everything I learned about you.');
         }
         case 'know': {
             if (!requireAdmin(message)) return;
             if (!requireDb(message)) return;
-            if (!rest) return message.reply(`Cú pháp: \`${PREFIX}know <chủ đề> | <nội dung>\``);
+            if (!rest) return message.reply(`Syntax: \`${PREFIX}know <topic> | <content>\``);
             const [topic, ...contentParts] = rest.split('|');
             const content = contentParts.join('|').trim();
-            if (!content) return message.reply(`Cú pháp: \`${PREFIX}know <chủ đề> | <nội dung>\` (thiếu dấu \`|\`).`);
+            if (!content) return message.reply(`Syntax: \`${PREFIX}know <topic> | <content>\` (missing a \`|\`).`);
             await dbAddKnowledge(message.guildId, topic.trim(), content, message.author.id);
-            return message.reply(`✅ Đã lưu kiến thức "${topic.trim()}" cho server.`);
+            return message.reply(`✅ Saved knowledge "${topic.trim()}" for this server.`);
         }
         case 'knowledge': {
             if (!requireDb(message)) return;
             const rows = await dbListKnowledge(message.guildId);
-            if (!rows.length) return message.reply('Server chưa có kiến thức nào được lưu.');
-            const lines = rows.map((k) => `\`${k.id.slice(0, 8)}\` — **${k.topic || '(không tiêu đề)'}**: ${k.content}`).join('\n');
-            return message.reply(`📚 Kiến thức đã lưu cho server:\n${lines}`);
+            if (!rows.length) return message.reply('This server has no saved knowledge yet.');
+            const lines = rows.map((k) => `\`${k.id.slice(0, 8)}\` — **${k.topic || '(no title)'}**: ${k.content}`).join('\n');
+            return message.reply(`📚 Knowledge saved for this server:\n${lines}`);
         }
         case 'forgetknowledge': {
             if (!requireAdmin(message)) return;
             if (!requireDb(message)) return;
-            if (!rest) return message.reply(`Hãy nhập id cần xoá (xem qua \`${PREFIX}knowledge\`).`);
+            if (!rest) return message.reply(`Enter the id to remove (check \`${PREFIX}knowledge\`).`);
             const rows = await dbListKnowledge(message.guildId, 100);
             const match = rows.find((k) => k.id.startsWith(rest));
-            if (!match) return message.reply('Không tìm thấy mục kiến thức đó.');
+            if (!match) return message.reply("Couldn't find that knowledge entry.");
             await dbDeleteKnowledge(match.id, message.guildId);
-            return message.reply(`🧹 Đã xoá kiến thức: "${match.topic || match.content}"`);
+            return message.reply(`🧹 Removed knowledge: "${match.topic || match.content}"`);
         }
         case 'search': {
             if (!requireDb(message)) return;
-            if (!rest) return message.reply(`Cú pháp: \`${PREFIX}search <từ khoá>\``);
+            if (!rest) return message.reply(`Syntax: \`${PREFIX}search <keywords>\``);
             const [facts, knowledge] = await Promise.all([
                 dbSearchUserFacts(message.author.id, rest, 8),
                 dbSearchKnowledge(message.guildId, rest, 8),
             ]);
-            if (!facts.length && !knowledge.length) return message.reply('🔎 Không tìm thấy gì khớp với từ khoá đó.');
+            if (!facts.length && !knowledge.length) return message.reply('🔎 Nothing matched that keyword.');
             const parts = [];
-            if (facts.length) parts.push('**Về bạn:**\n' + facts.map((f) => `- ${f.fact}`).join('\n'));
-            if (knowledge.length) parts.push('**Kiến thức server:**\n' + knowledge.map((k) => `- ${k.topic ? k.topic + ': ' : ''}${k.content}`).join('\n'));
-            return message.reply(`🔎 Kết quả cho "${rest}":\n\n${parts.join('\n\n')}`);
+            if (facts.length) parts.push('**About you:**\n' + facts.map((f) => `- ${f.fact}`).join('\n'));
+            if (knowledge.length) parts.push('**Server knowledge:**\n' + knowledge.map((k) => `- ${k.topic ? k.topic + ': ' : ''}${k.content}`).join('\n'));
+            return message.reply(`🔎 Results for "${rest}":\n\n${parts.join('\n\n')}`);
+        }
+        case 'aichat': {
+            if (!message.guild) return message.reply("This command only works inside a server, not in DMs.");
+            const { channel, created } = await createOrGetPrivateChatChannel(message.guild, message.member);
+            return message.reply(
+                created
+                    ? `✅ Created your private AI chat channel: ${channel}. Everyone in the server can still see it, but only you can send messages there — every message you send there is automatically treated as a message to me, no mention needed.`
+                    : `You already have a private AI chat channel: ${channel}`
+            );
         }
         default:
-            return message.reply(`Không rõ lệnh \`${PREFIX}${cmd}\`. Gõ \`${PREFIX}help\` để xem danh sách lệnh.`);
+            return message.reply(`Unknown command \`${PREFIX}${cmd}\`. Type \`${PREFIX}help\` for the command list.`);
     }
 }
 
@@ -1002,17 +1037,30 @@ client.on('messageCreate', async (message) => {
             await handleSlashLikeCommand(message);
         } catch (e) {
             console.error('Command error:', e);
-            message.reply('Đã có lỗi xảy ra khi thực hiện lệnh.').catch(() => {});
+            message.reply('Something went wrong running that command.').catch(() => {});
         }
         return;
     }
 
-    // Otherwise, only respond when mentioned (free-form AI chat).
-    if (!message.mentions.has(client.user)) return;
+    // A message counts as "directed at the bot" if any of these are true:
+    //  - it @mentions the bot
+    //  - it's a reply to one of the bot's own messages (keeps context of "the last answer")
+    //  - it's inside the user's own private AI chat channel (every message there is implicit)
+    const isOwnPrivateAiChannel = message.channel.topic === `private-ai-chat:${message.author.id}`;
+    const repliedToBotMessage = await getRepliedToBotMessage(message);
+    if (!message.mentions.has(client.user) && !isOwnPrivateAiChannel && !repliedToBotMessage) return;
 
-    const cleanPrompt = message.content.replace(/<@!?\d+>/g, '').trim();
+    let cleanPrompt = message.content.replace(/<@!?\d+>/g, '').trim();
+
+    // If this is a reply to the bot, splice the replied-to content in as explicit context
+    // so the model knows exactly what "that"/"it"/"this" is referring to.
+    if (repliedToBotMessage) {
+        const priorAnswer = repliedToBotMessage.content.slice(0, 600);
+        cleanPrompt = `(Replying to your previous message: "${priorAnswer}")\n${cleanPrompt}`;
+    }
+
     if (!cleanPrompt && message.attachments.size === 0) {
-        return message.reply(`Xin chào! Tôi có thể giúp gì cho bạn hôm nay? (Gõ \`${PREFIX}help\` để xem lệnh)`);
+        return message.reply(`Hi! What can I help you with today? (Type \`${PREFIX}help\` for the command list)`);
     }
 
     try {
@@ -1067,13 +1115,13 @@ client.on('messageCreate', async (message) => {
 
                     let toolResult;
                     if (!isAdmin && DESTRUCTIVE.has(fnName)) {
-                        toolResult = { ok: false, result: 'Chỉ Admin mới được phép thực hiện hành động này.' };
+                        toolResult = { ok: false, result: 'Only an Admin is allowed to perform this action.' };
                     } else {
                         try {
                             toolResult = await executeTool(ctx, fnName, args);
                         } catch (e) {
                             console.error(`Tool ${fnName} failed:`, e.message);
-                            toolResult = { ok: false, result: `Lỗi khi thực hiện "${fnName}": ${e.message}` };
+                            toolResult = { ok: false, result: `Error running "${fnName}": ${e.message}` };
                         }
                     }
                     messages.push({
@@ -1089,7 +1137,7 @@ client.on('messageCreate', async (message) => {
             botReply = choice.message.content;
             if (looksGarbled(botReply)) {
                 console.error('Mistral output looked garbled/mixed-script, retrying once.');
-                messages.push({ role: 'user', content: '(Câu trả lời trước bị lỗi hiển thị ký tự lạ. Hãy trả lời lại, chỉ dùng tiếng Việt/tiếng Anh bình thường.)' });
+                messages.push({ role: 'user', content: '(Your previous answer had a display glitch with mixed-up characters. Please answer again, using only normal text.)' });
                 const retryResp = await mistral.chat.complete({ model: TEXT_MODEL, messages, maxTokens: isCode ? 1800 : 900 });
                 botReply = retryResp.choices[0].message.content || botReply;
             }
@@ -1101,10 +1149,10 @@ client.on('messageCreate', async (message) => {
             providerUsed = result.provider;
         }
 
-        botReply = botReply || '(không có phản hồi)';
+        botReply = botReply || '(no response)';
         console.log(`[${message.guild?.name || 'DM'}] replied via ${providerUsed}`);
 
-        pushHistory(channelId, { role: 'user', content: hasImages ? `${cleanPrompt} [đã gửi ${imageUrls.length} ảnh]` : cleanPrompt });
+        pushHistory(channelId, { role: 'user', content: hasImages ? `${cleanPrompt} [sent ${imageUrls.length} image(s)]` : cleanPrompt });
         pushHistory(channelId, { role: 'assistant', content: botReply });
         saveStoreSoon();
 
@@ -1122,7 +1170,7 @@ client.on('messageCreate', async (message) => {
     } catch (error) {
         // Log full detail (SDK errors often carry a `.body` or `.rawValue` with the real reason)
         console.error('Execution Error:', error?.body || error?.rawValue || error);
-        await message.reply('Đã có lỗi xảy ra khi kết nối tới AI. Hãy thử lại sau nhé!');
+        await message.reply('Something went wrong connecting to the AI. Please try again in a moment!');
     }
 });
 
