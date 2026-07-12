@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@mistralai/mistralai": "^2.4.1",
+    "@supabase/supabase-js": "^2.45.0",
     "discord.js": "^14.14.1"
   }
 }
