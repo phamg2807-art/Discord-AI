@@ -34,8 +34,14 @@ const mistral = new Mistral({ apiKey: process.env.MISTRAL_API_KEY || '' });
 // ============================================================
 // 3. Config
 // ============================================================
-const TEXT_MODEL = 'mistral-large-latest';
-const VISION_MODEL = 'pixtral-large-latest';
+const TEXT_MODEL = 'mistral-large-latest';       // code questions + admin tool-calling (proven reliable)
+const VISION_MODEL = 'pixtral-large-latest';      // vision fallback if OpenRouter is unavailable
+const GROQ_MODEL_PRIMARY = 'llama-3.3-70b-versatile'; // general chat — fastest free option
+// NOTE: Groq announced (2026-06-17) that llama-3.3-70b-versatile / llama-3.1-8b-instant are being
+// sunset on the free/dev tier. openai/gpt-oss-120b is Groq's own recommended replacement, so it's
+// wired in as an automatic fallback below — no code change needed when the old model finally 404s.
+const GROQ_MODEL_FALLBACK = 'openai/gpt-oss-120b';
+const OPENROUTER_VISION_MODEL = 'nvidia/nemotron-3-nano-omni-30b-a3b:free'; // reads image/audio/video
 const HISTORY_LIMIT = 14;
 const FACT_LIMIT = 20;
 const LEARN_EVERY = 3;
@@ -147,6 +153,104 @@ async function collectImageUrls(message) {
         if (att.contentType && att.contentType.startsWith('image/')) urls.push(att.url);
     }
     return urls;
+}
+
+// ============================================================
+// 6b. Groq + OpenRouter — both are OpenAI-compatible REST APIs, so we
+//     call them with plain fetch() using snake_case fields (max_tokens,
+//     image_url, tool_calls...). This is a DIFFERENT casing convention
+//     than the Mistral SDK (which wants camelCase) — keep them separate,
+//     don't copy-paste fields between the two without checking.
+// ============================================================
+async function callGroq(messages, { model, maxTokens = 900 } = {}) {
+    const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${process.env.GROQ_API_KEY || ''}`,
+        },
+        body: JSON.stringify({ model, messages, max_tokens: maxTokens }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(`Groq(${model}): ${data?.error?.message || resp.status}`);
+    return data;
+}
+
+async function callOpenRouter(messages, { model, maxTokens = 900 } = {}) {
+    const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${process.env.OPENROUTER_API_KEY || ''}`,
+            'X-Title': 'SjpHelper Discord Bot',
+        },
+        body: JSON.stringify({ model, messages, max_tokens: maxTokens }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(`OpenRouter(${model}): ${data?.error?.message || resp.status}`);
+    return data;
+}
+
+// General conversational chat: fast free Groq primary, Groq's own recommended
+// replacement next, Mistral Large as the final safety net so the bot never
+// goes fully silent if both Groq models are down or renamed.
+async function getGeneralChatReply(messages) {
+    const chain = [
+        { provider: 'groq', model: GROQ_MODEL_PRIMARY },
+        { provider: 'groq', model: GROQ_MODEL_FALLBACK },
+        { provider: 'mistral', model: TEXT_MODEL },
+    ];
+    let lastErr;
+    for (const step of chain) {
+        try {
+            if (step.provider === 'groq') {
+                const data = await callGroq(messages, { model: step.model, maxTokens: 900 });
+                return { text: data.choices[0].message.content, provider: `groq/${step.model}` };
+            }
+            const resp = await mistral.chat.complete({ model: step.model, messages, maxTokens: 900 });
+            return { text: resp.choices[0].message.content, provider: `mistral/${step.model}` };
+        } catch (e) {
+            console.error(`General-chat provider failed (${step.provider}/${step.model}):`, e.message);
+            lastErr = e;
+        }
+    }
+    throw lastErr || new Error('All general-chat providers failed');
+}
+
+// Vision: OpenRouter's Nemotron 3 Nano Omni primary (confirmed free, also
+// handles audio/video), Mistral Pixtral as fallback (proven working already).
+async function getVisionReply(systemPrompt, history, cleanPrompt, imageUrls) {
+    const promptText = cleanPrompt || 'Hãy mô tả và phân tích (các) hình ảnh này.';
+    try {
+        const messages = [
+            { role: 'system', content: systemPrompt },
+            ...history,
+            {
+                role: 'user',
+                content: [
+                    { type: 'text', text: promptText },
+                    ...imageUrls.map((url) => ({ type: 'image_url', image_url: { url } })),
+                ],
+            },
+        ];
+        const data = await callOpenRouter(messages, { model: OPENROUTER_VISION_MODEL, maxTokens: 900 });
+        return { text: data.choices[0].message.content, provider: `openrouter/${OPENROUTER_VISION_MODEL}` };
+    } catch (e) {
+        console.error('OpenRouter vision failed, falling back to Mistral Pixtral:', e.message);
+    }
+    const messages = [
+        { role: 'system', content: systemPrompt },
+        ...history,
+        {
+            role: 'user',
+            content: [
+                { type: 'text', text: promptText },
+                ...imageUrls.map((url) => ({ type: 'image_url', imageUrl: url })), // Mistral wants camelCase here
+            ],
+        },
+    ];
+    const resp = await mistral.chat.complete({ model: VISION_MODEL, messages, maxTokens: 900 });
+    return { text: resp.choices[0].message.content, provider: `mistral/${VISION_MODEL}` };
 }
 
 // ============================================================
@@ -505,72 +609,71 @@ client.on('messageCreate', async (message) => {
         const hasImages = imageUrls.length > 0;
         const user = getUser(message.author.id, message.author.username);
         const channelId = message.channelId;
-
-        let userContent;
-        if (hasImages) {
-            userContent = [
-                { type: 'text', text: cleanPrompt || 'Hãy mô tả và phân tích (các) hình ảnh này.' },
-                // NOTE: the JS SDK requires camelCase "imageUrl", NOT "image_url" — using the
-                // snake_case key causes a silent validation failure that surfaces as a generic error.
-                ...imageUrls.map((url) => ({ type: 'image_url', imageUrl: url })),
-            ];
-        } else {
-            userContent = cleanPrompt;
-        }
-
+        const isCode = looksLikeCode(cleanPrompt);
         const systemPrompt = buildSystemPrompt(message.guildId, message.author.id, isAdmin);
         const history = getChannelHistory(channelId);
-        let messages = [{ role: 'system', content: systemPrompt }, ...history, { role: 'user', content: userContent }];
 
-        const model = hasImages ? VISION_MODEL : TEXT_MODEL;
-        const isCode = looksLikeCode(cleanPrompt);
+        let botReply;
+        let providerUsed;
 
-        // Only offer admin tools to admins — non-admins never even get the option
-        const activeTools = isAdmin ? tools : undefined;
+        if (hasImages) {
+            const result = await getVisionReply(systemPrompt, history, cleanPrompt, imageUrls);
+            botReply = result.text;
+            providerUsed = result.provider;
+        } else if (isAdmin || isCode) {
+            let messages = [{ role: 'system', content: systemPrompt }, ...history, { role: 'user', content: cleanPrompt }];
+            const activeTools = isAdmin ? tools : undefined;
 
-        let response = await mistral.chat.complete({
-            model,
-            messages,
-            tools: activeTools,
-            toolChoice: activeTools ? 'auto' : undefined,
-            maxTokens: isCode ? 1800 : 900,
-        });
+            let response = await mistral.chat.complete({
+                model: TEXT_MODEL,
+                messages,
+                tools: activeTools,
+                toolChoice: activeTools ? 'auto' : undefined,
+                maxTokens: isCode ? 1800 : 900,
+            });
+            let choice = response.choices[0];
 
-        let choice = response.choices[0];
+            let guard = 0;
+            while (choice.message.toolCalls && choice.message.toolCalls.length && guard < 5) {
+                guard++;
+                messages.push(choice.message);
+                for (const call of choice.message.toolCalls) {
+                    const fnName = call.function.name;
+                    let args = {};
+                    try { args = JSON.parse(call.function.arguments); } catch (_) {}
 
-        // Tool-calling loop (handles the model chaining a couple of actions)
-        let guard = 0;
-        while (choice.message.toolCalls && choice.message.toolCalls.length && guard < 5) {
-            guard++;
-            messages.push(choice.message);
-            for (const call of choice.message.toolCalls) {
-                const fnName = call.function.name;
-                let args = {};
-                try { args = JSON.parse(call.function.arguments); } catch (_) {}
-
-                let toolResult;
-                if (!isAdmin && DESTRUCTIVE.has(fnName)) {
-                    toolResult = { ok: false, result: 'Chỉ Admin mới được phép thực hiện hành động này.' };
-                } else {
-                    try {
-                        toolResult = await executeTool(message.guild, fnName, args);
-                    } catch (e) {
-                        console.error(`Tool ${fnName} failed:`, e.message);
-                        toolResult = { ok: false, result: `Lỗi khi thực hiện "${fnName}": ${e.message}` };
+                    let toolResult;
+                    if (!isAdmin && DESTRUCTIVE.has(fnName)) {
+                        toolResult = { ok: false, result: 'Chỉ Admin mới được phép thực hiện hành động này.' };
+                    } else {
+                        try {
+                            toolResult = await executeTool(message.guild, fnName, args);
+                        } catch (e) {
+                            console.error(`Tool ${fnName} failed:`, e.message);
+                            toolResult = { ok: false, result: `Lỗi khi thực hiện "${fnName}": ${e.message}` };
+                        }
                     }
+                    messages.push({
+                        role: 'tool',
+                        name: fnName,
+                        toolCallId: call.id,
+                        content: JSON.stringify(toolResult),
+                    });
                 }
-                messages.push({
-                    role: 'tool',
-                    name: fnName,
-                    toolCallId: call.id,
-                    content: JSON.stringify(toolResult),
-                });
+                response = await mistral.chat.complete({ model: TEXT_MODEL, messages, tools: activeTools, toolChoice: 'auto', maxTokens: 900 });
+                choice = response.choices[0];
             }
-            response = await mistral.chat.complete({ model: TEXT_MODEL, messages, tools: activeTools, toolChoice: 'auto', maxTokens: 900 });
-            choice = response.choices[0];
+            botReply = choice.message.content;
+            providerUsed = `mistral/${TEXT_MODEL}`;
+        } else {
+            const messages = [{ role: 'system', content: systemPrompt }, ...history, { role: 'user', content: cleanPrompt }];
+            const result = await getGeneralChatReply(messages);
+            botReply = result.text;
+            providerUsed = result.provider;
         }
 
-        const botReply = choice.message.content || '(không có phản hồi)';
+        botReply = botReply || '(không có phản hồi)';
+        console.log(`[${message.guild?.name || 'DM'}] replied via ${providerUsed}`);
 
         pushHistory(channelId, { role: 'user', content: hasImages ? `${cleanPrompt} [đã gửi ${imageUrls.length} ảnh]` : cleanPrompt });
         pushHistory(channelId, { role: 'assistant', content: botReply });
