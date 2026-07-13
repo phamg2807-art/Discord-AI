@@ -48,18 +48,15 @@ const OPENROUTER_VISION_CHAIN = [
 
 const HISTORY_LIMIT = 14;
 const FACT_LIMIT = 20;
-const RETRIEVAL_LIMIT = 4; // how many DB rows to pull into context per search
+const RETRIEVAL_LIMIT = 6; // how many DB rows to pull into context per search (bumped up — this is now the bot's real memory, not a bonus)
 const PREFIX = '-'; // command prefix for all "-" commands
 const DATA_FILE = path.join(__dirname, 'memory.json');
 const DISCORD_MAX_LEN = 2000;
 const CHUNK_SIZE = 1900; // leave headroom under Discord's 2000 char limit
 
 // ============================================================
-// 3b. NEW — presence awareness + emotional tone + voice bridge config
+// 3b. presence awareness + emotional tone + voice bridge config
 // ============================================================
-// How long a user can go quiet mid-conversation before the bot checks in.
-// Kept generous on purpose — this should feel like a friend noticing you
-// went quiet, not a bot nagging you every two minutes.
 const IDLE_CHECKIN_MS = 6 * 60_000;       // 6 minutes of silence -> check in once
 const IDLE_SWEEP_INTERVAL_MS = 60_000;    // how often we scan for idle users
 const WELCOME_BACK_WINDOW_MS = 45 * 60_000; // if they were gone < this, it's a "welcome back", not a fresh start
@@ -89,20 +86,8 @@ function markCheckinSent(channelId, userId) {
 }
 
 // ============================================================
-// 3c. NEW — voice<->text bridge (shared via Supabase table `bot_bridge`)
+// 3c. voice<->text bridge (shared via Supabase table `bot_bridge`)
 // ============================================================
-// The voice bot and this text bot are separate processes/tokens, so the
-// only way for them to hand things to each other is a shared row in the
-// database. Two message "kinds" flow through this table:
-//   - kind: 'voice_request'  (voice bot -> text bot): the voice AI wants
-//     something from the user it can't get by talking — an image, a file,
-//     a link, a longer piece of text — so it asks the text bot to relay
-//     that request into the user's private AI text channel.
-//   - kind: 'text_reply'     (text bot -> voice bot): the user responded
-//     in text/attachments to that request (or just said something the
-//     voice bot should know about), so the text bot drops it back for the
-//     voice bot to pick up and speak about next turn.
-// See SUPABASE_SETUP.md / bridge_schema.sql for the table definition.
 const BRIDGE_POLL_INTERVAL_MS = 8_000;
 let lastBridgePollAt = 0;
 
@@ -189,6 +174,15 @@ const DEFAULT_PERSONA =
     "If the user's request is unclear, or if learning more about their interests/work/projects would help you " +
     'answer better in the future, feel free to ask a natural follow-up question (don\'t interrogate them — at ' +
     'most one question per turn). ' +
+    '\n\nMEMORY — YOU ARE A LIBRARIAN, NOT JUST A CHATBOT: ' +
+    'You have a real long-term memory made of two layers: (1) global facts about this user, true across every ' +
+    'server/channel they talk to you in, and (2) this-channel memory, specific to the private conversation ' +
+    'happening right here. Treat search_knowledge like walking into a library and looking something up — use it ' +
+    'proactively, BEFORE answering, any time the question could possibly connect to something said before, not ' +
+    'only when the user explicitly says "remember" or "recall". Prefer checking memory over guessing or asking ' +
+    'the user to repeat themselves. When you learn something durable, save it with remember_fact using the right ' +
+    'scope: "user" for things true about them everywhere, "channel" for things that only make sense in the ' +
+    'context of this specific private chat/thread, "guild" for server-wide info (Admins only). ' +
     'When a user shares something durable and useful about themselves, remember it using the remember_fact tool. ' +
     'Before answering something that might have been saved before, ALWAYS use the search_knowledge tool first to ' +
     'check if relevant info exists — do this proactively, not only when explicitly asked to recall something. ' +
@@ -211,15 +205,53 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
         '(facts, shared knowledge, search, voice bridge) are disabled until you configure them. See SUPABASE_SETUP.md.');
 }
 function dbEnabled() { return supabase !== null; }
-function escapeForIlike(s) { return String(s).replace(/[%,()]/g, ' ').trim(); }
-function extractKeywords(text, max = 5) {
-    return String(text || '')
-        .split(/\s+/)
-        .map((w) => escapeForIlike(w))
-        .filter((w) => w.length > 2)
-        .slice(0, max);
+
+// ------------------------------------------------------------
+// Full-text search helpers (replaces old ilike keyword matching).
+// Postgres websearch_to_tsquery understands natural phrases the way a
+// search engine does ("quotes", -exclude, AND/OR), which is a much
+// better fit for "search like a library" than substring ILIKE scans.
+// Falls back gracefully to ILIKE if the `fts` column/migration isn't
+// present yet, so this won't hard-break existing setups.
+// ------------------------------------------------------------
+function sanitizeFtsQuery(text) {
+    return String(text || '').trim().slice(0, 300);
 }
 
+async function ftsSearch(table, filters, query, limit) {
+    const q = sanitizeFtsQuery(query);
+    if (!q) return [];
+    let builder = supabase.from(table).select('*');
+    for (const [col, val] of Object.entries(filters)) builder = builder.eq(col, val);
+    builder = builder.textSearch('fts', q, { type: 'websearch', config: 'english' }).limit(limit);
+    const { data, error } = await builder;
+    if (error) {
+        // Column may not exist yet (migration not run) — fall back to ILIKE so the bot still works.
+        console.error(`ftsSearch(${table}) failed, falling back to ILIKE:`, error.message);
+        return ilikeFallbackSearch(table, filters, q, limit);
+    }
+    return data || [];
+}
+
+async function ilikeFallbackSearch(table, filters, query, limit) {
+    const keywords = String(query)
+        .split(/\s+/)
+        .map((w) => w.replace(/[%,()]/g, ' ').trim())
+        .filter((w) => w.length > 2)
+        .slice(0, 5);
+    if (!keywords.length) return [];
+    const searchCols = table === 'user_facts' ? ['fact'] : ['content', 'topic'];
+    const orFilter = keywords
+        .flatMap((k) => searchCols.map((c) => `${c}.ilike.%${k}%`))
+        .join(',');
+    let builder = supabase.from(table).select('*');
+    for (const [col, val] of Object.entries(filters)) builder = builder.eq(col, val);
+    const { data, error } = await builder.or(orFilter).limit(limit);
+    if (error) { console.error(`ilikeFallbackSearch(${table}):`, error.message); return []; }
+    return data || [];
+}
+
+// ---- user_facts (global, cross-channel identity/personality facts) ----
 async function dbAddUserFact(userId, guildId, fact) {
     if (!dbEnabled()) return null;
     const { data, error } = await supabase
@@ -253,15 +285,10 @@ async function dbClearUserFacts(userId) {
 }
 async function dbSearchUserFacts(userId, query, limit = RETRIEVAL_LIMIT) {
     if (!dbEnabled() || !query) return [];
-    const keywords = extractKeywords(query);
-    if (!keywords.length) return [];
-    const orFilter = keywords.map((k) => `fact.ilike.%${k}%`).join(',');
-    const { data, error } = await supabase
-        .from('user_facts').select('*').eq('user_id', userId).or(orFilter).limit(limit);
-    if (error) { console.error('dbSearchUserFacts:', error.message); return []; }
-    return data || [];
+    return ftsSearch('user_facts', { user_id: userId }, query, limit);
 }
 
+// ---- knowledge_base (server-wide, Admin-curated) ----
 async function dbAddKnowledge(guildId, topic, content, createdBy) {
     if (!dbEnabled()) return null;
     const { data, error } = await supabase
@@ -289,13 +316,49 @@ async function dbDeleteKnowledge(id, guildId) {
 }
 async function dbSearchKnowledge(guildId, query, limit = RETRIEVAL_LIMIT) {
     if (!dbEnabled() || !query) return [];
-    const keywords = extractKeywords(query);
-    if (!keywords.length) return [];
-    const orFilter = keywords.map((k) => `content.ilike.%${k}%,topic.ilike.%${k}%`).join(',');
+    return ftsSearch('knowledge_base', { guild_id: guildId }, query, limit);
+}
+
+// ---- channel_memory (NEW — per private-AI-channel "brand database") ----
+// Each user's private AI chat channel gets its own isolated memory scope,
+// layered on top of (not instead of) their global user_facts. This is
+// where channel-specific context lives: things that only make sense in
+// the context of that one ongoing private conversation/thread, separate
+// from durable facts about the person that should follow them everywhere.
+async function dbAddChannelMemory(channelId, userId, guildId, topic, content) {
+    if (!dbEnabled()) return null;
     const { data, error } = await supabase
-        .from('knowledge_base').select('*').eq('guild_id', guildId).or(orFilter).limit(limit);
-    if (error) { console.error('dbSearchKnowledge:', error.message); return []; }
+        .from('channel_memory')
+        .insert({ channel_id: channelId, user_id: userId, guild_id: guildId, topic: topic || null, content })
+        .select()
+        .single();
+    if (error) { console.error('dbAddChannelMemory:', error.message); return null; }
+    return data;
+}
+async function dbListChannelMemory(channelId, limit = FACT_LIMIT) {
+    if (!dbEnabled()) return [];
+    const { data, error } = await supabase
+        .from('channel_memory').select('*').eq('channel_id', channelId)
+        .order('created_at', { ascending: false }).limit(limit);
+    if (error) { console.error('dbListChannelMemory:', error.message); return []; }
     return data || [];
+}
+async function dbDeleteChannelMemory(id, channelId) {
+    if (!dbEnabled()) return false;
+    const { error, count } = await supabase
+        .from('channel_memory').delete({ count: 'exact' }).eq('id', id).eq('channel_id', channelId);
+    if (error) { console.error('dbDeleteChannelMemory:', error.message); return false; }
+    return (count || 0) > 0;
+}
+async function dbClearChannelMemory(channelId) {
+    if (!dbEnabled()) return false;
+    const { error } = await supabase.from('channel_memory').delete().eq('channel_id', channelId);
+    if (error) { console.error('dbClearChannelMemory:', error.message); return false; }
+    return true;
+}
+async function dbSearchChannelMemory(channelId, query, limit = RETRIEVAL_LIMIT) {
+    if (!dbEnabled() || !query) return [];
+    return ftsSearch('channel_memory', { channel_id: channelId }, query, limit);
 }
 
 // ============================================================
@@ -345,7 +408,13 @@ function pushHistory(channelId, entry) {
 // ============================================================
 // 6. Learning — decide what's worth remembering after each reply
 // ============================================================
-async function learnAndStore(userId, guildId, isAdmin, recentUserText, recentHistory) {
+// UPDATED: now classifies into THREE buckets instead of two — user_facts
+// (global, follows the person everywhere), channel_memory (specific to
+// this one private chat/thread — e.g. an ongoing story, project, or
+// context that only makes sense in this room), and guild_knowledge
+// (server-wide, Admin-authored). This keeps the library well-organized
+// instead of dumping every detail into one big undifferentiated bucket.
+async function learnAndStore(userId, guildId, channelId, isPrivateAiChannel, isAdmin, recentUserText, recentHistory) {
     if (!dbEnabled() || !recentUserText || !recentUserText.trim()) return;
     try {
         const contextWindow = (recentHistory || []).slice(-6)
@@ -355,30 +424,43 @@ async function learnAndStore(userId, guildId, isAdmin, recentUserText, recentHis
             ? `Recent conversation:\n${contextWindow}\n\nUser's latest message: ${recentUserText}`
             : `User's message: ${recentUserText}`;
 
+        const channelHint = isPrivateAiChannel
+            ? 'This conversation is happening in the user\'s own private AI chat channel — a good place for ' +
+              'channel-specific ongoing context (e.g. a story/project being worked on together) as well as ' +
+              'global facts about the person.'
+            : 'This conversation is happening in a shared/public channel.';
+
         const resp = await mistral.chat.complete({
             model: TEXT_MODEL,
             messages: [
                 {
                     role: 'system',
                     content:
-                        'Read the conversation below and decide if there is anything worth remembering LONG-TERM ' +
-                        'about the user. Be reasonably generous — not just things they stated directly, but anything ' +
-                        'reasonably inferable: interests, job, ongoing projects, goals, relationships or opinions about ' +
-                        'specific people/things, habits, circumstances... If the user mentions a specific person/event ' +
-                        'with a clear opinion or emotion (e.g. dislikes, likes, trusts, conflicts with someone), that is ' +
-                        'ALSO worth remembering. ONLY skip pure greetings, one-off technical questions, or messages that ' +
-                        "carry no real information. If the message is a rule/info that applies to the whole server " +
-                        '(not just this person), put it under "guild_knowledge" instead of "user_facts". ' +
-                        'Write each item concisely, in third person (e.g. "Dislikes someone named Kenkai for being full ' +
-                        'of himself"). ' +
+                        'Read the conversation below and decide what is worth remembering LONG-TERM, sorting it into ' +
+                        'the correct bucket, like a librarian filing things on the right shelf. Be reasonably generous ' +
+                        '— not just things stated directly, but anything reasonably inferable: interests, job, ongoing ' +
+                        'projects, goals, relationships or opinions about specific people/things, habits, circumstances. ' +
+                        `${channelHint} ` +
+                        'Buckets:\n' +
+                        '- "user_facts": durable facts about the PERSON that are true no matter where they talk to you ' +
+                        '(identity, preferences, relationships, opinions, traits, long-running goals).\n' +
+                        '- "channel_memory": context that only makes sense as part of THIS specific ongoing chat/thread ' +
+                        '(e.g. details of a story, project, or plan being built up over this conversation specifically) ' +
+                        '— use this instead of user_facts when the info is really about "what we are doing/discussing ' +
+                        'in this room" rather than a lasting trait of the person.\n' +
+                        '- "guild_knowledge": info that applies to the whole SERVER, not just this person (rules, ' +
+                        'events, shared context) — only used if the requester is an Admin.\n' +
+                        'ONLY skip pure greetings, one-off technical questions, or messages with no real information. ' +
+                        'Write each item concisely, in third person. ' +
                         'Return ONLY JSON in this exact format: ' +
-                        '{"user_facts": ["..."], "guild_knowledge": [{"topic": "...", "content": "..."}]}. ' +
-                        'If there is truly nothing worth remembering, return {"user_facts": [], "guild_knowledge": []}.',
+                        '{"user_facts": ["..."], "channel_memory": [{"topic": "...", "content": "..."}], ' +
+                        '"guild_knowledge": [{"topic": "...", "content": "..."}]}. ' +
+                        'If nothing fits a bucket, return an empty array for it.',
                 },
                 { role: 'user', content: transcript },
             ],
             responseFormat: { type: 'json_object' },
-            maxTokens: 300,
+            maxTokens: 400,
         });
         const parsed = JSON.parse(resp.choices[0].message.content);
 
@@ -388,7 +470,17 @@ async function learnAndStore(userId, guildId, isAdmin, recentUserText, recentHis
             for (const fact of parsed.user_facts) {
                 if (fact && typeof fact === 'string' && !existingLower.has(fact.toLowerCase())) {
                     const saved = await dbAddUserFact(userId, guildId, fact.slice(0, 500));
-                    if (saved) console.log(`🧠 Learned about ${userId}: ${fact}`);
+                    if (saved) console.log(`🧠 [user_facts] ${userId}: ${fact}`);
+                }
+            }
+        }
+        if (isPrivateAiChannel && Array.isArray(parsed.channel_memory) && parsed.channel_memory.length) {
+            const existing = await dbListChannelMemory(channelId, FACT_LIMIT);
+            const existingLower = new Set(existing.map((f) => f.content.toLowerCase()));
+            for (const item of parsed.channel_memory) {
+                if (item && item.content && !existingLower.has(String(item.content).toLowerCase())) {
+                    const saved = await dbAddChannelMemory(channelId, userId, guildId, (item.topic || '').slice(0, 200), String(item.content).slice(0, 1000));
+                    if (saved) console.log(`📎 [channel_memory] ${channelId}: ${item.content}`);
                 }
             }
         }
@@ -396,7 +488,7 @@ async function learnAndStore(userId, guildId, isAdmin, recentUserText, recentHis
             for (const item of parsed.guild_knowledge) {
                 if (item && item.content) {
                     const saved = await dbAddKnowledge(guildId, (item.topic || '').slice(0, 200), String(item.content).slice(0, 1000), userId);
-                    if (saved) console.log(`📚 Saved guild knowledge for ${guildId}: ${item.content}`);
+                    if (saved) console.log(`📚 [guild_knowledge] ${guildId}: ${item.content}`);
                 }
             }
         }
@@ -408,32 +500,45 @@ async function learnAndStore(userId, guildId, isAdmin, recentUserText, recentHis
 // ============================================================
 // 7. Prompt / content helpers
 // ============================================================
-async function buildSystemPrompt(guildId, userId, isAdmin, retrievedFacts, retrievedKnowledge, presenceNote) {
+async function buildSystemPrompt(guildId, userId, channelId, isPrivateAiChannel, isAdmin, retrieved, presenceNote) {
     const persona = getGuild(guildId).persona;
     let sys = persona;
 
-    // FIX: this call used to silently fail to matter much because nothing forced the
-    // model to use it — the persona now explicitly instructs proactive search_knowledge
-    // use, and this baseline dump still always includes the user's known facts.
-    const facts = await dbListUserFacts(userId, FACT_LIMIT);
+    // Baseline library dump: always load the user's known global facts,
+    // AND — if this is their private AI channel — this channel's own
+    // memory too, so the bot's "brand database" for that room is always
+    // in view, not just pulled in reactively via search_knowledge.
+    const [facts, channelMem] = await Promise.all([
+        dbListUserFacts(userId, FACT_LIMIT),
+        isPrivateAiChannel ? dbListChannelMemory(channelId, FACT_LIMIT) : Promise.resolve([]),
+    ]);
     if (facts.length) {
-        sys += `\n\nThings you already know about this user (use naturally, don't just list them out):\n- ${facts.map((f) => f.fact).join('\n- ')}`;
+        sys += `\n\nGlobal library — things you already know about this user everywhere (use naturally, don't just list them out):\n- ${facts.map((f) => f.fact).join('\n- ')}`;
     }
-    if (retrievedFacts && retrievedFacts.length) {
-        sys += `\n\nRelevant info found about this user while looking up the current question:\n- ${retrievedFacts.map((f) => f.fact).join('\n- ')}`;
+    if (channelMem.length) {
+        sys += `\n\nThis channel's own memory shelf — context specific to this private conversation:\n- ${channelMem.map((c) => `${c.topic ? c.topic + ': ' : ''}${c.content}`).join('\n- ')}`;
     }
-    if (retrievedKnowledge && retrievedKnowledge.length) {
-        sys += `\n\nRelevant knowledge found in this server's database (only use if actually relevant, don't make things up if unsure):\n- ${retrievedKnowledge.map((k) => `${k.topic ? k.topic + ': ' : ''}${k.content}`).join('\n- ')}`;
+    if (retrieved) {
+        if (retrieved.facts && retrieved.facts.length) {
+            sys += `\n\nRelevant items found in the global library while looking up the current question:\n- ${retrieved.facts.map((f) => f.fact).join('\n- ')}`;
+        }
+        if (retrieved.channelMemory && retrieved.channelMemory.length) {
+            sys += `\n\nRelevant items found on this channel's memory shelf:\n- ${retrieved.channelMemory.map((c) => `${c.topic ? c.topic + ': ' : ''}${c.content}`).join('\n- ')}`;
+        }
+        if (retrieved.knowledge && retrieved.knowledge.length) {
+            sys += `\n\nRelevant knowledge found in this server's database (only use if actually relevant, don't make things up if unsure):\n- ${retrieved.knowledge.map((k) => `${k.topic ? k.topic + ': ' : ''}${k.content}`).join('\n- ')}`;
+        }
     }
-    // NEW — presence awareness: tell the model if this user just came back
-    // after being away, so its reply can naturally acknowledge that instead
-    // of pretending no time passed.
     if (presenceNote) {
         sys += `\n\n${presenceNote}`;
     }
     sys += isAdmin
         ? '\n\nThe person messaging you is an Admin of this server, allowed to use any admin tool.'
         : '\n\nThe person messaging you is NOT an Admin — if they ask for an admin action, explain that only an Admin can do that, and do not call the tool.';
+    if (isPrivateAiChannel) {
+        sys += '\n\nThis is the user\'s own private AI chat channel — their personal "brand database" room. You may ' +
+               'freely save channel-specific memory here (scope "channel") in addition to global facts (scope "user").';
+    }
     if (!dbEnabled()) {
         sys += '\n\nNOTE: The long-term knowledge database is currently not configured, so you have no persistent memory of this user beyond the current conversation. Do not claim to remember things from before this chat.';
     }
@@ -452,10 +557,6 @@ async function collectImageUrls(message) {
     }
     return urls;
 }
-// NEW — non-image attachments (e.g. text files, PDFs referenced by name)
-// are surfaced by name so the model knows something was sent, even if it
-// can't read the file contents directly. Useful for the voice-bridge flow
-// where a user might drop a document in response to a voice request.
 function collectOtherAttachments(message) {
     const others = [];
     for (const att of message.attachments.values()) {
@@ -597,13 +698,15 @@ const knowledgeTools = [
         function: {
             name: 'search_knowledge',
             description:
-                "Search the long-term knowledge database for information relevant to the current question — " +
-                "both this server's shared knowledge base and facts previously learned about this user. " +
-                "ALWAYS use this before answering if there is ANY chance the answer might depend on something " +
-                "discussed, saved, or mentioned before — not just when the user explicitly asks you to recall something.",
+                "Search the long-term knowledge database, like looking something up in a library, before answering. " +
+                "Searches across: (1) this channel's own memory shelf (if in a private AI channel), (2) the user's " +
+                "global facts (true everywhere), and (3) this server's shared knowledge base. ALWAYS use this before " +
+                "answering if there is ANY chance the answer might depend on something discussed, saved, or " +
+                "mentioned before — not just when the user explicitly asks you to recall something. Prefer this over " +
+                "guessing or asking the user to repeat context they've already given you.",
             parameters: {
                 type: 'object',
-                properties: { query: { type: 'string', description: 'Keywords to search for' } },
+                properties: { query: { type: 'string', description: 'Natural-language search phrase — full-text search, so normal words/phrases work well' } },
                 required: ['query'],
             },
         },
@@ -613,14 +716,16 @@ const knowledgeTools = [
         function: {
             name: 'remember_fact',
             description:
-                'Save a durable, useful piece of information to long-term memory. Use scope "user" for facts ' +
-                'about the specific person you are talking to, or scope "guild" for information relevant to the ' +
-                'whole server (only actually saved if the requester is an Admin).',
+                'File a durable, useful piece of information onto the correct memory shelf. Use scope "user" for ' +
+                'facts about the specific person that should follow them everywhere. Use scope "channel" for context ' +
+                'that only makes sense as part of THIS specific private conversation/thread (only works inside a ' +
+                'private AI chat channel). Use scope "guild" for information relevant to the whole server (only ' +
+                'actually saved if the requester is an Admin).',
             parameters: {
                 type: 'object',
                 properties: {
-                    scope: { type: 'string', enum: ['user', 'guild'] },
-                    topic: { type: 'string', description: 'Short label, mainly used for guild-scope facts' },
+                    scope: { type: 'string', enum: ['user', 'channel', 'guild'] },
+                    topic: { type: 'string', description: 'Short label, mainly used for channel/guild-scope facts' },
                     content: { type: 'string', description: 'The fact/information to remember' },
                 },
                 required: ['scope', 'content'],
@@ -855,13 +960,17 @@ async function executeTool(ctx, name, args) {
     switch (name) {
         case 'search_knowledge': {
             if (!dbEnabled()) return { ok: false, result: 'The knowledge database is not configured yet.' };
-            const [facts, knowledge] = await Promise.all([
+            const [facts, channelMem, knowledge] = await Promise.all([
                 dbSearchUserFacts(ctx.userId, args.query),
+                ctx.isPrivateAiChannel ? dbSearchChannelMemory(ctx.channelId, args.query) : Promise.resolve([]),
                 dbSearchKnowledge(ctx.guildId, args.query),
             ]);
-            if (!facts.length && !knowledge.length) return { ok: true, result: 'Nothing relevant found in the database.' };
+            if (!facts.length && !channelMem.length && !knowledge.length) {
+                return { ok: true, result: 'Nothing relevant found in the database.' };
+            }
             const lines = [];
-            if (facts.length) lines.push('About this user:\n' + facts.map((f) => `- ${f.fact}`).join('\n'));
+            if (channelMem.length) lines.push('This channel\'s memory shelf:\n' + channelMem.map((c) => `- ${c.topic ? c.topic + ': ' : ''}${c.content}`).join('\n'));
+            if (facts.length) lines.push('About this user (global):\n' + facts.map((f) => `- ${f.fact}`).join('\n'));
             if (knowledge.length) lines.push('Server knowledge:\n' + knowledge.map((k) => `- ${k.topic ? k.topic + ': ' : ''}${k.content}`).join('\n'));
             return { ok: true, result: lines.join('\n\n') };
         }
@@ -872,6 +981,11 @@ async function executeTool(ctx, name, args) {
                 if (!ctx.isAdmin) return { ok: false, result: 'Only an Admin can save shared server knowledge.' };
                 await dbAddKnowledge(ctx.guildId, args.topic, args.content, ctx.userId);
                 return { ok: true, result: `Saved shared server knowledge: "${args.content}".` };
+            }
+            if (args.scope === 'channel') {
+                if (!ctx.isPrivateAiChannel) return { ok: false, result: 'Channel-scoped memory can only be saved inside a private AI chat channel.' };
+                await dbAddChannelMemory(ctx.channelId, ctx.userId, ctx.guildId, args.topic, args.content);
+                return { ok: true, result: `Saved to this channel's memory: "${args.content}".` };
             }
             await dbAddUserFact(ctx.userId, ctx.guildId, args.content);
             return { ok: true, result: `Remembered about you: "${args.content}".` };
@@ -990,11 +1104,16 @@ const HELP_TEXT = [
     `\`${PREFIX}persona <description>\` — change the AI's tone/persona for this server`,
     `\`${PREFIX}resetpersona\` — reset to the default persona`,
     '',
-    '**Personal memory (AI learns about you)**',
-    `\`${PREFIX}whatyouknow\` — see what the bot remembers about you`,
-    `\`${PREFIX}remember <thing to remember>\` — manually tell the bot to remember something`,
+    '**Personal memory (AI learns about you, global — follows you everywhere)**',
+    `\`${PREFIX}whatyouknow\` — see what the bot remembers about you globally`,
+    `\`${PREFIX}remember <thing to remember>\` — manually tell the bot to remember something about you`,
     `\`${PREFIX}forget <id>\` — forget one specific thing (id comes from whatyouknow)`,
-    `\`${PREFIX}forgetme\` — erase everything the bot remembers about you`,
+    `\`${PREFIX}forgetme\` — erase everything the bot remembers about you globally`,
+    '',
+    '**This channel\'s memory (private AI chat only — this room\'s own "brand database")**',
+    `\`${PREFIX}channelmemory\` — list what's saved specifically for this private chat`,
+    `\`${PREFIX}forgetchannel <id>\` — remove one entry from this channel's memory`,
+    `\`${PREFIX}forgetchannelall\` — wipe this channel's entire memory (does not touch your global facts)`,
     '',
     '**Shared server knowledge (Admin)**',
     `\`${PREFIX}know <topic> | <content>\` — save a piece of knowledge shared by the whole server`,
@@ -1002,10 +1121,10 @@ const HELP_TEXT = [
     `\`${PREFIX}forgetknowledge <id>\` — remove a server knowledge entry`,
     '',
     '**Lookup**',
-    `\`${PREFIX}search <keywords>\` — search personal memory + server knowledge`,
+    `\`${PREFIX}search <keywords>\` — full-text search across your global facts, this channel's memory (if applicable), and server knowledge`,
     '',
     '**Private AI channel**',
-    `\`${PREFIX}aichat\` — create (or open) your own private chat channel with the AI. Everyone can see it, but only you can type there`,
+    `\`${PREFIX}aichat\` — create (or open) your own private chat channel with the AI. Everyone can see it, but only you can type there. This channel gets its own memory database in addition to your global facts`,
     '',
     `You can also **mention the bot** (\`@SjpHelper\`) or **reply to one of its messages** with a question, any time.`,
     '',
@@ -1025,15 +1144,10 @@ function requireDb(message) {
     }
     return true;
 }
+function isPrivateAiChannelFor(message) {
+    return message.channel.topic === `private-ai-chat:${message.author.id}`;
+}
 
-// FIX: this text bot and the separate Local voice bot both listen for the
-// same "-" prefix in the same channels. This bot has no voice functionality
-// at all, so any "-voice ..." (or bare "-join"/"-leave") command is meant
-// for the OTHER bot. Previously this bot's default case still replied
-// "Unknown command" to those, which showed up as a confusing duplicate/
-// conflicting reply right next to the voice bot's real response. Now it
-// silently ignores commands that clearly belong to the voice bot instead
-// of responding at all.
 const VOICE_BOT_COMMANDS = new Set(['voice', 'join', 'leave']);
 
 async function handleSlashLikeCommand(message) {
@@ -1081,13 +1195,13 @@ async function handleSlashLikeCommand(message) {
             const facts = await dbListUserFacts(message.author.id);
             if (!facts.length) return message.reply("I haven't learned anything special about you yet!");
             const lines = facts.map((f) => `\`${f.id.slice(0, 8)}\` — ${f.fact}`).join('\n');
-            return message.reply(`Here's what I remember about you:\n${lines}`);
+            return message.reply(`Here's what I remember about you globally:\n${lines}`);
         }
         case 'remember': {
             if (!requireDb(message)) return;
             if (!rest) return message.reply(`Enter what to remember, e.g. \`${PREFIX}remember I like modding Fabric\`.`);
             await dbAddUserFact(message.author.id, message.guildId, rest);
-            return message.reply(`✅ Remembered: "${rest}"`);
+            return message.reply(`✅ Remembered (globally): "${rest}"`);
         }
         case 'forget': {
             if (!requireDb(message)) return;
@@ -1101,7 +1215,31 @@ async function handleSlashLikeCommand(message) {
         case 'forgetme': {
             if (!requireDb(message)) return;
             await dbClearUserFacts(message.author.id);
-            return message.reply('🧹 Erased everything I learned about you.');
+            return message.reply('🧹 Erased everything I globally remember about you.');
+        }
+        case 'channelmemory': {
+            if (!requireDb(message)) return;
+            if (!isPrivateAiChannelFor(message)) return message.reply('This command only works inside your own private AI chat channel.');
+            const rows = await dbListChannelMemory(message.channelId);
+            if (!rows.length) return message.reply("This channel's memory is empty so far.");
+            const lines = rows.map((c) => `\`${c.id.slice(0, 8)}\` — ${c.topic ? `**${c.topic}**: ` : ''}${c.content}`).join('\n');
+            return message.reply(`📎 This channel's memory:\n${lines}`);
+        }
+        case 'forgetchannel': {
+            if (!requireDb(message)) return;
+            if (!isPrivateAiChannelFor(message)) return message.reply('This command only works inside your own private AI chat channel.');
+            if (!rest) return message.reply(`Enter the id to forget (check \`${PREFIX}channelmemory\`).`);
+            const rows = await dbListChannelMemory(message.channelId, 100);
+            const match = rows.find((c) => c.id.startsWith(rest));
+            if (!match) return message.reply("Couldn't find that in this channel's memory.");
+            await dbDeleteChannelMemory(match.id, message.channelId);
+            return message.reply(`🧹 Forgot from this channel: "${match.content}"`);
+        }
+        case 'forgetchannelall': {
+            if (!requireDb(message)) return;
+            if (!isPrivateAiChannelFor(message)) return message.reply('This command only works inside your own private AI chat channel.');
+            await dbClearChannelMemory(message.channelId);
+            return message.reply("🧹 Wiped this channel's memory. Your global facts are untouched.");
         }
         case 'know': {
             if (!requireAdmin(message)) return;
@@ -1133,13 +1271,16 @@ async function handleSlashLikeCommand(message) {
         case 'search': {
             if (!requireDb(message)) return;
             if (!rest) return message.reply(`Syntax: \`${PREFIX}search <keywords>\``);
-            const [facts, knowledge] = await Promise.all([
+            const isPrivate = isPrivateAiChannelFor(message);
+            const [facts, channelMem, knowledge] = await Promise.all([
                 dbSearchUserFacts(message.author.id, rest, 8),
+                isPrivate ? dbSearchChannelMemory(message.channelId, rest, 8) : Promise.resolve([]),
                 dbSearchKnowledge(message.guildId, rest, 8),
             ]);
-            if (!facts.length && !knowledge.length) return message.reply('🔎 Nothing matched that keyword.');
+            if (!facts.length && !channelMem.length && !knowledge.length) return message.reply('🔎 Nothing matched that search.');
             const parts = [];
-            if (facts.length) parts.push('**About you:**\n' + facts.map((f) => `- ${f.fact}`).join('\n'));
+            if (channelMem.length) parts.push('**This channel\'s memory:**\n' + channelMem.map((c) => `- ${c.topic ? c.topic + ': ' : ''}${c.content}`).join('\n'));
+            if (facts.length) parts.push('**About you (global):**\n' + facts.map((f) => `- ${f.fact}`).join('\n'));
             if (knowledge.length) parts.push('**Server knowledge:**\n' + knowledge.map((k) => `- ${k.topic ? k.topic + ': ' : ''}${k.content}`).join('\n'));
             return message.reply(`🔎 Results for "${rest}":\n\n${parts.join('\n\n')}`);
         }
@@ -1148,7 +1289,7 @@ async function handleSlashLikeCommand(message) {
             const { channel, created } = await createOrGetPrivateChatChannel(message.guild, message.member);
             return message.reply(
                 created
-                    ? `✅ Created your private AI chat channel: ${channel}. Everyone in the server can still see it, but only you can send messages there — every message you send there is automatically treated as a message to me, no mention needed.`
+                    ? `✅ Created your private AI chat channel: ${channel}. Everyone in the server can still see it, but only you can send messages there — every message you send there is automatically treated as a message to me, no mention needed. This channel also gets its own memory database (\`${PREFIX}channelmemory\`), separate from but layered with your global facts.`
                     : `You already have a private AI chat channel: ${channel}`
             );
         }
@@ -1162,24 +1303,11 @@ async function handleSlashLikeCommand(message) {
 // ============================================================
 // 11. Helpers for sending long replies safely
 // ============================================================
-// FIX for the "chunk 2 doesn't generate" bug: the original code split
-// botReply with a regex and fired off `message.channel.send(chunk)` calls
-// without checking whether each one actually succeeded, and without any
-// delay — a rejected/rate-limited send for chunk 2 was silently swallowed
-// (nothing awaited/caught it beyond the outer try/catch, and one bad chunk
-// stopped the loop from continuing since the whole handler's catch block
-// only logs "Something went wrong" once, at the very end, giving no idea
-// which chunk failed or why). This version:
-//   - splits on paragraph/sentence boundaries where possible, not mid-word
-//   - awaits each send in order, sequentially (never fire-and-forget)
-//   - catches each chunk's error individually and reports which chunk failed
-//   - adds a tiny delay between chunks to avoid Discord rate limits
 function splitIntoChunks(text, maxLen = CHUNK_SIZE) {
     if (text.length <= maxLen) return [text];
     const chunks = [];
     let remaining = text;
     while (remaining.length > maxLen) {
-        // Prefer to break at the last newline, then last space, within the limit.
         let breakAt = remaining.lastIndexOf('\n', maxLen);
         if (breakAt < maxLen * 0.5) breakAt = remaining.lastIndexOf(' ', maxLen);
         if (breakAt < maxLen * 0.5) breakAt = maxLen; // no good break point, hard-cut
@@ -1209,26 +1337,18 @@ async function sendLongReply(message, text) {
             try {
                 await message.channel.send(`⚠️ (part ${i + 1} of my reply failed to send: ${e.message})`);
             } catch (_) { /* give up quietly if even the error notice fails */ }
-            // Keep going with remaining chunks instead of aborting the whole reply.
         }
         if (i < chunks.length - 1) await new Promise((res) => setTimeout(res, 350));
     }
 }
 
 // ============================================================
-// 12. NEW — presence sweep: idle check-ins + welcome-backs
+// 12. presence sweep: idle check-ins + welcome-backs
 // ============================================================
-// Every IDLE_SWEEP_INTERVAL_MS, look for any tracked user who went quiet
-// mid-conversation (i.e. we were actively talking, then they stopped
-// responding) and, once, send a warm little check-in message in that same
-// channel. When they eventually do talk again, touchPresence() (called at
-// the top of the main handler) detects the gap and we pass a note into the
-// system prompt so the reply naturally acknowledges the return — instead
-// of a hardcoded "welcome back!" every time, the model folds it in.
 async function presenceSweep() {
     const now = Date.now();
     for (const [key, p] of presence.entries()) {
-        if (p.awaitingReturn) continue; // already nudged, waiting for them to come back
+        if (p.awaitingReturn) continue;
         if (p.checkinsSent >= MAX_CHECKINS_PER_THREAD) continue;
         if (now - p.lastActiveAt < IDLE_CHECKIN_MS) continue;
 
@@ -1238,7 +1358,7 @@ async function presenceSweep() {
             if (!channel || !channel.isTextBased()) { presence.delete(key); continue; }
 
             const history = getChannelHistory(channelId);
-            if (!history.length) { presence.delete(key); continue; } // nothing was actually being discussed
+            if (!history.length) { presence.delete(key); continue; }
 
             const guildId = channel.guildId;
             const persona = guildId ? getGuild(guildId).persona : DEFAULT_PERSONA;
@@ -1296,9 +1416,9 @@ client.on('messageCreate', async (message) => {
         return;
     }
 
-    const isOwnPrivateAiChannel = message.channel.topic === `private-ai-chat:${message.author.id}`;
+    const isPrivateAiChannel = isPrivateAiChannelFor(message);
     const repliedToBotMessage = await getRepliedToBotMessage(message);
-    if (!message.mentions.has(client.user) && !isOwnPrivateAiChannel && !repliedToBotMessage) return;
+    if (!message.mentions.has(client.user) && !isPrivateAiChannel && !repliedToBotMessage) return;
 
     let cleanPrompt = message.content.replace(/<@!?\d+>/g, '').trim();
 
@@ -1328,8 +1448,6 @@ client.on('messageCreate', async (message) => {
         const isCode = looksLikeCode(cleanPrompt);
         const history = getChannelHistory(channelId);
 
-        // NEW — presence awareness: figure out if this user is returning
-        // after a meaningful gap, BEFORE we touch presence for this turn.
         const { wasAway, awayForMs } = touchPresence(channelId, message.author.id);
         let presenceNote = null;
         if (wasAway) {
@@ -1346,10 +1464,6 @@ client.on('messageCreate', async (message) => {
             }
         }
 
-        // NEW — if this text message is actually the user answering something
-        // the voice-chat AI asked for (a file/text the voice bot requested via
-        // the bridge), forward it to voice as well so that conversation stays
-        // in sync, and let the model know so its text reply can acknowledge it.
         let bridgeNote = null;
         if (dbEnabled() && message.guildId) {
             try {
@@ -1381,19 +1495,20 @@ client.on('messageCreate', async (message) => {
         }
         if (bridgeNote) presenceNote = presenceNote ? `${presenceNote}\n\n${bridgeNote}` : bridgeNote;
 
-        // Retrieval-augmented context: look up anything relevant before answering.
-        // FIX: this used to be skipped for hasImages, which is fine, but was otherwise
-        // the ONLY way facts got pulled in for non-tool-using paths (general chat) —
-        // buildSystemPrompt below always also pulls the user's full fact list now,
-        // so general chat / vision replies get durable memory even without going
-        // through the tool-calling path.
-        const [retrievedFacts, retrievedKnowledge] = hasImages
-            ? [[], []]
-            : await Promise.all([
+        // Retrieval-augmented context: search the whole library before answering.
+        // Now uses full-text search and always runs (even for images, using
+        // whatever caption text came with them) since this IS the bot's memory,
+        // not just a bonus for the tool-calling path.
+        let retrieved = { facts: [], channelMemory: [], knowledge: [] };
+        if (!hasImages || cleanPrompt) {
+            const [facts, channelMem, knowledge] = await Promise.all([
                 dbSearchUserFacts(message.author.id, cleanPrompt),
+                isPrivateAiChannel ? dbSearchChannelMemory(channelId, cleanPrompt) : Promise.resolve([]),
                 dbSearchKnowledge(message.guildId, cleanPrompt),
             ]);
-        const systemPrompt = await buildSystemPrompt(message.guildId, message.author.id, isAdmin, retrievedFacts, retrievedKnowledge, presenceNote);
+            retrieved = { facts, channelMemory: channelMem, knowledge };
+        }
+        const systemPrompt = await buildSystemPrompt(message.guildId, message.author.id, channelId, isPrivateAiChannel, isAdmin, retrieved, presenceNote);
 
         let botReply;
         let providerUsed;
@@ -1402,10 +1517,15 @@ client.on('messageCreate', async (message) => {
             const result = await getVisionReply(systemPrompt, history, cleanPrompt, imageUrls);
             botReply = result.text;
             providerUsed = result.provider;
-        } else if (isAdmin || isCode) {
+        } else if (isAdmin || isCode || dbEnabled()) {
+            // NOTE: general users now also get tool access (search_knowledge/
+            // remember_fact) whenever the DB is enabled, not just Admins/code
+            // questions — this is the "focus more on database" change: every
+            // eligible message can actively search/save memory, not only the
+            // narrow set of cases that used to trigger tool-calling.
             let messages = [{ role: 'system', content: systemPrompt }, ...history, { role: 'user', content: cleanPrompt }];
             const activeTools = isAdmin ? [...knowledgeTools, ...adminTools] : knowledgeTools;
-            const ctx = { guild: message.guild, userId: message.author.id, guildId: message.guildId, isAdmin };
+            const ctx = { guild: message.guild, userId: message.author.id, guildId: message.guildId, channelId, isPrivateAiChannel, isAdmin };
 
             let response = await mistral.chat.complete({
                 model: TEXT_MODEL,
@@ -1470,8 +1590,9 @@ client.on('messageCreate', async (message) => {
 
         user.msgCount += 1;
         saveStoreSoon();
-        // Fire-and-forget: decide what (if anything) is worth remembering long-term.
-        learnAndStore(message.author.id, message.guildId, isAdmin, cleanPrompt, history);
+        // Fire-and-forget: decide what (if anything) is worth remembering long-term,
+        // and file it onto the correct shelf (global / this-channel / server-wide).
+        learnAndStore(message.author.id, message.guildId, channelId, isPrivateAiChannel, isAdmin, cleanPrompt, history);
 
         await sendLongReply(message, botReply);
     } catch (error) {
