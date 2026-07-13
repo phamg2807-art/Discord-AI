@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, Partials, PermissionsBitField, ChannelType, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, PermissionsBitField, ChannelType, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { Mistral } = require('@mistralai/mistralai');
 const { createClient } = require('@supabase/supabase-js');
 const http = require('http');
@@ -48,7 +48,7 @@ const OPENROUTER_VISION_CHAIN = [
 
 const HISTORY_LIMIT = 14;
 const FACT_LIMIT = 20;
-const RETRIEVAL_LIMIT = 6; // how many DB rows to pull into context per search (bumped up — this is now the bot's real memory, not a bonus)
+const RETRIEVAL_LIMIT = 6; // how many DB rows to pull into context per search (this is the bot's real memory, not a bonus)
 const PREFIX = '-'; // command prefix for all "-" commands
 const DATA_FILE = path.join(__dirname, 'memory.json');
 const DISCORD_MAX_LEN = 2000;
@@ -59,7 +59,6 @@ const CHUNK_SIZE = 1900; // leave headroom under Discord's 2000 char limit
 // ============================================================
 
 const BRIDGE_POLL_INTERVAL_MS = 8_000;
-let lastBridgePollAt = 0;
 
 async function pollBridgeForVoiceRequests() {
     if (!dbEnabled()) return;
@@ -136,14 +135,14 @@ const DEFAULT_PERSONA =
     'care, the way an attentive friend would sound, not a corporate script. ' +
     'When a user sends an image, describe/analyze it. ' +
     'When a user sends code, read it carefully, explain clearly, and return code in a markdown block (```lang). ' +
-    'LANGUAGE RULE: Default to natural, fluent English. If a user writes to you in a different language, ' +
-    'reply in that same language for that exchange instead. Never mix unrelated scripts/languages into a ' +
-    'single reply unless the user explicitly asks for a translation. ' +
     'If the user is an Admin and asks you to manage the server (create/delete/rename channels, manage roles, ' +
     'kick/timeout), use the matching tool instead of just describing how to do it. ' +
     "If the user's request is unclear, or if learning more about their interests/work/projects would help you " +
     'answer better in the future, feel free to ask a natural follow-up question (don\'t interrogate them — at ' +
     'most one question per turn). ' +
+    'IMPORTANT: You never proactively message the user out of nowhere (no "checking in", no commenting on gaps ' +
+    'in conversation, no "are you still there / thinking / wandering off" messages). You only ever speak in ' +
+    'direct response to something the user just sent. ' +
     '\n\nMEMORY — YOU ARE A LIBRARIAN, NOT JUST A CHATBOT: ' +
     'You have a real long-term memory made of two layers: (1) global facts about this user, true across every ' +
     'server/channel they talk to you in, and (2) this-channel memory, specific to the private conversation ' +
@@ -178,11 +177,6 @@ function dbEnabled() { return supabase !== null; }
 
 // ------------------------------------------------------------
 // Full-text search helpers (replaces old ilike keyword matching).
-// Postgres websearch_to_tsquery understands natural phrases the way a
-// search engine does ("quotes", -exclude, AND/OR), which is a much
-// better fit for "search like a library" than substring ILIKE scans.
-// Falls back gracefully to ILIKE if the `fts` column/migration isn't
-// present yet, so this won't hard-break existing setups.
 // ------------------------------------------------------------
 function sanitizeFtsQuery(text) {
     return String(text || '').trim().slice(0, 300);
@@ -196,7 +190,6 @@ async function ftsSearch(table, filters, query, limit) {
     builder = builder.textSearch('fts', q, { type: 'websearch', config: 'english' }).limit(limit);
     const { data, error } = await builder;
     if (error) {
-        // Column may not exist yet (migration not run) — fall back to ILIKE so the bot still works.
         console.error(`ftsSearch(${table}) failed, falling back to ILIKE:`, error.message);
         return ilikeFallbackSearch(table, filters, q, limit);
     }
@@ -289,10 +282,6 @@ async function dbSearchKnowledge(guildId, query, limit = RETRIEVAL_LIMIT) {
     return ftsSearch('knowledge_base', { guild_id: guildId }, query, limit);
 }
 
-// Diagnostic: raw counts, bypassing search/filters entirely, so -dbcheck can
-// tell the difference between "no rows exist" vs "rows exist but search/guild
-// filter isn't matching them" — the two failure modes that look identical
-// from the outside ("Knowledge Base isn't working").
 async function dbDiagnostics(guildId, userId, channelId) {
     if (!dbEnabled()) return null;
     const [ufAll, ufMine, kbAll, kbMine, cmAll, cmMine] = await Promise.all([
@@ -314,12 +303,7 @@ async function dbDiagnostics(guildId, userId, channelId) {
     };
 }
 
-// ---- channel_memory (NEW — per private-AI-channel "brand database") ----
-// Each user's private AI chat channel gets its own isolated memory scope,
-// layered on top of (not instead of) their global user_facts. This is
-// where channel-specific context lives: things that only make sense in
-// the context of that one ongoing private conversation/thread, separate
-// from durable facts about the person that should follow them everywhere.
+// ---- channel_memory (per private-AI-channel "brand database") ----
 async function dbAddChannelMemory(channelId, userId, guildId, topic, content) {
     if (!dbEnabled()) return null;
     const { data, error } = await supabase
@@ -358,21 +342,21 @@ async function dbSearchChannelMemory(channelId, query, limit = RETRIEVAL_LIMIT) 
 
 // ---- channel_settings (per private-AI-channel configuration) ----------
 // Powers the pinned settings embed: privacy, auto-learn, tool use,
-// language lock, verbosity, persona override, and notification prefs.
+// language, verbosity, persona override, visibility, and notification prefs.
 const DEFAULT_CHANNEL_SETTINGS = {
     privacy_save_memory: true,
     auto_learn: true,
     allow_tools: true,
-    language_lock: null,
-    verbosity: 'normal', // 'concise' | 'normal' | 'detailed'
+    language_lock: null,       // null (auto) | 'en' | 'vi'
+    verbosity: 'normal',       // 'concise' | 'normal' | 'detailed'
     persona_override: null,
     notify_on_mention: true,
     notify_on_reply: true,
+    visible_to_everyone: false, // false = fully private (only owner can even see it), true = everyone can view/read, only owner can type
 };
 
 // Small in-memory cache so we're not round-tripping to Supabase on every
-// single message just to read toggle state — settings change rarely
-// (button clicks), so a short-lived cache is safe and fast.
+// single message just to read toggle state.
 const channelSettingsCache = new Map(); // channelId -> { data, fetchedAt }
 const SETTINGS_CACHE_TTL_MS = 15_000;
 
@@ -385,7 +369,6 @@ async function dbGetChannelSettings(channelId, userId, guildId) {
         .from('channel_settings').select('*').eq('channel_id', channelId).maybeSingle();
     if (error) { console.error('dbGetChannelSettings:', error.message); return { ...DEFAULT_CHANNEL_SETTINGS, channel_id: channelId }; }
     if (!data) {
-        // First time — create the row with defaults.
         const { data: created, error: insertErr } = await supabase
             .from('channel_settings')
             .insert({ channel_id: channelId, user_id: userId, guild_id: guildId, ...DEFAULT_CHANNEL_SETTINGS })
@@ -395,8 +378,10 @@ async function dbGetChannelSettings(channelId, userId, guildId) {
         channelSettingsCache.set(channelId, { data: created, fetchedAt: Date.now() });
         return created;
     }
-    channelSettingsCache.set(channelId, { data, fetchedAt: Date.now() });
-    return data;
+    // Backfill in case older rows predate a newly-added column (e.g. visible_to_everyone).
+    const merged = { ...DEFAULT_CHANNEL_SETTINGS, ...data };
+    channelSettingsCache.set(channelId, { data: merged, fetchedAt: Date.now() });
+    return merged;
 }
 
 async function dbUpdateChannelSettings(channelId, patch) {
@@ -408,8 +393,9 @@ async function dbUpdateChannelSettings(channelId, patch) {
         .select()
         .single();
     if (error) { console.error('dbUpdateChannelSettings:', error.message); return null; }
-    channelSettingsCache.set(channelId, { data, fetchedAt: Date.now() });
-    return data;
+    const merged = { ...DEFAULT_CHANNEL_SETTINGS, ...data };
+    channelSettingsCache.set(channelId, { data: merged, fetchedAt: Date.now() });
+    return merged;
 }
 
 async function dbSetSettingsMessageId(channelId, messageId) {
@@ -421,14 +407,6 @@ async function dbSetSettingsMessageId(channelId, messageId) {
 }
 
 // ---- Full wipe helpers ----------------------------------------------
-// These are the "easier to remove AI data" + "admin deletes DB rows but
-// bot still knows" fix. Deleting Supabase rows alone is NOT enough,
-// because the bot ALSO keeps a rolling local chat history (memory.json,
-// via store.channels[channelId]) that gets replayed into every prompt —
-// that's genuine short-term conversational memory, separate from the
-// long-term DB, and it has to be cleared explicitly or the model will
-// keep "remembering" facts purely from the recent transcript even after
-// the DB rows backing them are gone.
 async function dbWipeUserEverywhere(userId) {
     if (!dbEnabled()) return { ok: false, reason: 'db_disabled' };
     const results = await Promise.all([
@@ -450,24 +428,6 @@ async function dbWipeGuildEverywhere(guildId) {
     return { ok: errors.length === 0, errors: errors.map((e) => e.message) };
 }
 
-// Clears the LOCAL rolling chat history + in-memory presence state for a
-// user, everywhere it appears across tracked channels. This is what makes
-// "forget" actually stick immediately instead of the model still echoing
-// recently-deleted facts back from its short-term transcript memory.
-function clearLocalHistoryForUser(userId, displayNameGuess) {
-    let clearedChannels = 0;
-    for (const channelId of Object.keys(store.channels)) {
-        const before = store.channels[channelId].length;
-        // We don't tag history entries by userId today, so in shared/public
-        // channels we can't selectively strip just this user's lines without
-        // risking corrupting other users' turns. Full-wipe commands (forgetme,
-        // forgetchannelall, dbwipe) therefore clear the ENTIRE channel history
-        // for channels that are this user's own private AI channel (safe,
-        // single-user), and leave shared-channel history alone (multi-user).
-        if (channelId) clearedChannels++;
-    }
-    return clearedChannels;
-}
 function clearLocalChannelHistory(channelId) {
     if (store.channels[channelId]) {
         store.channels[channelId] = [];
@@ -477,7 +437,6 @@ function clearLocalChannelHistory(channelId) {
     return false;
 }
 function clearLocalGuildHistory(guildIdChannels) {
-    // guildIdChannels: array of channelIds belonging to the guild, resolved by caller
     let n = 0;
     for (const channelId of guildIdChannels) {
         if (store.channels[channelId]) { store.channels[channelId] = []; n++; }
@@ -533,12 +492,6 @@ function pushHistory(channelId, entry) {
 // ============================================================
 // 6. Learning — decide what's worth remembering after each reply
 // ============================================================
-// UPDATED: now classifies into THREE buckets instead of two — user_facts
-// (global, follows the person everywhere), channel_memory (specific to
-// this one private chat/thread — e.g. an ongoing story, project, or
-// context that only makes sense in this room), and guild_knowledge
-// (server-wide, Admin-authored). This keeps the library well-organized
-// instead of dumping every detail into one big undifferentiated bucket.
 async function learnAndStore(userId, guildId, channelId, isPrivateAiChannel, isAdmin, recentUserText, recentHistory) {
     if (!dbEnabled() || !recentUserText || !recentUserText.trim()) return;
     try {
@@ -625,14 +578,30 @@ async function learnAndStore(userId, guildId, channelId, isPrivateAiChannel, isA
 // ============================================================
 // 7. Prompt / content helpers
 // ============================================================
-async function buildSystemPrompt(guildId, userId, channelId, isPrivateAiChannel, isAdmin, retrieved, presenceNote) {
-    const persona = getGuild(guildId).persona;
+const LANGUAGE_INSTRUCTIONS = {
+    en: 'LANGUAGE RULE: Always reply in English, regardless of what language the user writes in. If they write in ' +
+        'another language, still answer in English (you may note you noticed their language, but keep the actual ' +
+        'answer in English).',
+    vi: 'LANGUAGE RULE: Luôn trả lời bằng tiếng Việt, bất kể người dùng viết bằng ngôn ngữ nào. Nếu họ viết bằng ' +
+        'ngôn ngữ khác, vẫn trả lời bằng tiếng Việt tự nhiên, trôi chảy.',
+    auto: 'LANGUAGE RULE: Default to natural, fluent English. If a user writes to you in a different language, ' +
+          'reply in that same language for that exchange instead. Never mix unrelated scripts/languages into a ' +
+          'single reply unless the user explicitly asks for a translation.',
+};
+
+const VERBOSITY_INSTRUCTIONS = {
+    concise: 'RESPONSE LENGTH: Keep answers short and to the point — a few sentences at most unless the user is ' +
+             'clearly asking for something long-form (like code or a document). Avoid padding or repeating yourself.',
+    normal: 'RESPONSE LENGTH: Use your normal judgement on length — as long as it needs to be to actually help, ' +
+            'no longer.',
+    detailed: 'RESPONSE LENGTH: Prefer thorough, well-explained answers. Walk through your reasoning, add relevant ' +
+              'context, and don\'t be afraid of a longer reply when the topic warrants it.',
+};
+
+async function buildSystemPrompt(guildId, userId, channelId, isPrivateAiChannel, isAdmin, retrieved, settings) {
+    const persona = (settings && settings.persona_override) ? settings.persona_override : getGuild(guildId).persona;
     let sys = persona;
 
-    // Baseline library dump: always load the user's known global facts,
-    // AND — if this is their private AI channel — this channel's own
-    // memory too, so the bot's "brand database" for that room is always
-    // in view, not just pulled in reactively via search_knowledge.
     const [facts, channelMem] = await Promise.all([
         dbListUserFacts(userId, FACT_LIMIT),
         isPrivateAiChannel ? dbListChannelMemory(channelId, FACT_LIMIT) : Promise.resolve([]),
@@ -654,9 +623,6 @@ async function buildSystemPrompt(guildId, userId, channelId, isPrivateAiChannel,
             sys += `\n\nRelevant knowledge found in this server's database (only use if actually relevant, don't make things up if unsure):\n- ${retrieved.knowledge.map((k) => `${k.topic ? k.topic + ': ' : ''}${k.content}`).join('\n- ')}`;
         }
     }
-    if (presenceNote) {
-        sys += `\n\n${presenceNote}`;
-    }
     sys += isAdmin
         ? '\n\nThe person messaging you is an Admin of this server, allowed to use any admin tool.'
         : '\n\nThe person messaging you is NOT an Admin — if they ask for an admin action, explain that only an Admin can do that, and do not call the tool.';
@@ -667,16 +633,22 @@ async function buildSystemPrompt(guildId, userId, channelId, isPrivateAiChannel,
     if (!dbEnabled()) {
         sys += '\n\nNOTE: The long-term knowledge database is currently not configured, so you have no persistent memory of this user beyond the current conversation. Do not claim to remember things from before this chat.';
     }
-    // IMPORTANT: the lists above (global facts + channel memory) are pulled
-    // FRESH from the database on every message. If earlier turns in this
-    // conversation mentioned a fact that is NOT present in these lists right
-    // now, treat it as stale/removed — the database is the current source
-    // of truth, not what you said a few messages ago. Do not re-assert or
-    // rely on a fact just because it appeared earlier in this chat if it's
-    // no longer showing up in the lists above.
     sys += '\n\nMEMORY SOURCE OF TRUTH: The facts/memory lists above reflect the database RIGHT NOW. If something ' +
            'you or the user mentioned earlier in this conversation is not in those lists anymore, treat it as ' +
            'deleted — don\'t keep asserting it just because it appeared earlier in the chat transcript.';
+
+    // Per-channel settings now actually shape the reply, not just display state.
+    if (settings) {
+        const langKey = settings.language_lock === 'en' ? 'en' : settings.language_lock === 'vi' ? 'vi' : 'auto';
+        sys += `\n\n${LANGUAGE_INSTRUCTIONS[langKey]}`;
+        const verbKey = VERBOSITY_INSTRUCTIONS[settings.verbosity] ? settings.verbosity : 'normal';
+        sys += `\n\n${VERBOSITY_INSTRUCTIONS[verbKey]}`;
+        if (isPrivateAiChannel && !settings.privacy_save_memory) {
+            sys += '\n\nPRIVACY MODE IS ON for this channel: the user has disabled saving new long-term memory from ' +
+                   'this conversation. Do not call remember_fact for scope "channel" or "user" based on this chat, ' +
+                   'even if something durable comes up — you may still read/search existing memory, just don\'t add to it.';
+        }
+    }
     return sys;
 }
 function looksLikeCode(text) {
@@ -1060,11 +1032,13 @@ async function createOrGetPrivateChatChannel(guild, member) {
         name: channelName,
         type: ChannelType.GuildText,
         topic: `private-ai-chat:${member.id}`,
+        // Default state: fully private. @everyone denied ViewChannel entirely.
+        // The "visible_to_everyone" setting (default off) can later widen this
+        // to allow read-only viewing for the whole server.
         permissionOverwrites: [
             {
                 id: guild.roles.everyone.id,
-                allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.ReadMessageHistory],
-                deny: [PermissionsBitField.Flags.SendMessages],
+                deny: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages],
             },
             {
                 id: member.id,
@@ -1086,14 +1060,37 @@ async function createOrGetPrivateChatChannel(guild, member) {
         ],
     });
 
-    // Post + pin the dynamic settings embed right away so it's the first
-    // thing waiting in a brand-new private AI channel.
     if (dbEnabled()) {
         await dbGetChannelSettings(channel.id, member.id, guild.id); // creates the settings row with defaults
         await postOrRefreshSettingsEmbed(channel, member.id, guild.id);
     }
 
     return { channel, created: true };
+}
+
+// Applies the visible_to_everyone toggle to the actual Discord permission
+// overwrites for @everyone on this channel. Only-owner-can-type is preserved
+// either way; this only changes whether @everyone can view/read.
+async function applyChannelVisibility(channel, visibleToEveryone) {
+    try {
+        const everyoneId = channel.guild.roles.everyone.id;
+        if (visibleToEveryone) {
+            await channel.permissionOverwrites.edit(everyoneId, {
+                ViewChannel: true,
+                ReadMessageHistory: true,
+                SendMessages: false,
+            });
+        } else {
+            await channel.permissionOverwrites.edit(everyoneId, {
+                ViewChannel: false,
+                SendMessages: false,
+            });
+        }
+        return true;
+    } catch (e) {
+        console.error('applyChannelVisibility failed:', e.message);
+        return false;
+    }
 }
 
 // ------------------------------------------------------------
@@ -1103,8 +1100,14 @@ async function createOrGetPrivateChatChannel(guild, member) {
 // same (dynamic, not a spam of new messages).
 // ------------------------------------------------------------
 const VERBOSITY_CYCLE = ['concise', 'normal', 'detailed'];
+const LANGUAGE_CYCLE = [null, 'en', 'vi'];
 
 function onOff(bool) { return bool ? '✅ On' : '❌ Off'; }
+function languageLabel(code) {
+    if (code === 'en') return '🇬🇧 English';
+    if (code === 'vi') return '🇻🇳 Vietnamese';
+    return '🌐 Auto-detect';
+}
 
 function buildSettingsEmbed(settings, member) {
     return new EmbedBuilder()
@@ -1115,10 +1118,11 @@ function buildSettingsEmbed(settings, member) {
         )
         .setColor(0x5865f2)
         .addFields(
-            { name: '🔒 Privacy — save channel memory', value: onOff(settings.privacy_save_memory), inline: true },
+            { name: '🔒 Privacy — save memory', value: onOff(settings.privacy_save_memory), inline: true },
             { name: '🧠 Auto-learn from chat', value: onOff(settings.auto_learn), inline: true },
             { name: '🛠️ Allow AI tool use', value: onOff(settings.allow_tools), inline: true },
-            { name: '🌐 Language lock', value: settings.language_lock ? settings.language_lock.toUpperCase() : 'Auto-detect', inline: true },
+            { name: '👀 Visible to everyone', value: onOff(settings.visible_to_everyone), inline: true },
+            { name: '🌐 Language', value: languageLabel(settings.language_lock), inline: true },
             { name: '📝 Response verbosity', value: settings.verbosity.charAt(0).toUpperCase() + settings.verbosity.slice(1), inline: true },
             { name: '🎭 Persona override', value: settings.persona_override ? 'Custom (set)' : 'Server default', inline: true },
             { name: '🔔 Notify on mention', value: onOff(settings.notify_on_mention), inline: true },
@@ -1133,15 +1137,16 @@ function buildSettingsButtonRows(settings) {
         new ButtonBuilder().setCustomId('cs:toggle:privacy_save_memory').setLabel(settings.privacy_save_memory ? 'Privacy: On' : 'Privacy: Off').setStyle(settings.privacy_save_memory ? ButtonStyle.Success : ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId('cs:toggle:auto_learn').setLabel(settings.auto_learn ? 'Auto-learn: On' : 'Auto-learn: Off').setStyle(settings.auto_learn ? ButtonStyle.Success : ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId('cs:toggle:allow_tools').setLabel(settings.allow_tools ? 'Tools: On' : 'Tools: Off').setStyle(settings.allow_tools ? ButtonStyle.Success : ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId('cs:toggle:notify_on_mention').setLabel(settings.notify_on_mention ? 'Notify: On' : 'Notify: Off').setStyle(settings.notify_on_mention ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('cs:toggle:visible_to_everyone').setLabel(settings.visible_to_everyone ? 'Visible: Everyone' : 'Visible: Only me').setStyle(settings.visible_to_everyone ? ButtonStyle.Success : ButtonStyle.Secondary),
     );
     const row2 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('cs:cycle:verbosity').setLabel(`Verbosity: ${settings.verbosity}`).setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId('cs:cycle:language_lock').setLabel(`Language: ${settings.language_lock ? settings.language_lock.toUpperCase() : 'Auto'}`).setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId('cs:persona:edit').setLabel('Edit persona override').setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId('cs:persona:clear').setLabel('Clear persona override').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId('cs:cycle:language_lock').setLabel(`Language: ${languageLabel(settings.language_lock)}`).setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('cs:toggle:notify_on_mention').setLabel(settings.notify_on_mention ? 'Notify: On' : 'Notify: Off').setStyle(settings.notify_on_mention ? ButtonStyle.Success : ButtonStyle.Secondary),
     );
     const row3 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('cs:persona:edit').setLabel('Edit persona override').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('cs:persona:clear').setLabel('Clear persona override').setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId('cs:refresh').setLabel('🔄 Refresh').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId('cs:reset').setLabel('↩️ Reset to defaults').setStyle(ButtonStyle.Danger),
     );
@@ -1160,7 +1165,6 @@ async function postOrRefreshSettingsEmbed(channel, userId, guildId) {
             await existingMsg.edit({ embeds: [embed], components });
             return existingMsg;
         } catch (e) {
-            // Message was deleted/unpinned externally — fall through and repost.
             console.error('postOrRefreshSettingsEmbed: could not fetch/edit existing message, reposting:', e.message);
         }
     }
@@ -1195,6 +1199,9 @@ async function executeTool(ctx, name, args) {
         case 'remember_fact': {
             if (!dbEnabled()) return { ok: false, result: 'The knowledge database is not configured yet.' };
             if (!args.content) return { ok: false, result: 'Missing content to remember.' };
+            if (ctx.settings && ctx.isPrivateAiChannel && !ctx.settings.privacy_save_memory && args.scope !== 'guild') {
+                return { ok: false, result: 'Privacy mode is on for this channel — new memory is not being saved right now.' };
+            }
             if (args.scope === 'guild') {
                 if (!ctx.isAdmin) return { ok: false, result: 'Only an Admin can save shared server knowledge.' };
                 await dbAddKnowledge(ctx.guildId, args.topic, args.content, ctx.userId);
@@ -1348,11 +1355,11 @@ const HELP_TEXT = [
     `\`${PREFIX}search <keywords>\` — full-text search across your global facts, this channel's memory (if applicable), and server knowledge`,
     '',
     '**Private AI channel**',
-    `\`${PREFIX}aichat\` — create (or open) your own private chat channel with the AI. Everyone can see it, but only you can type there. This channel gets its own memory database in addition to your global facts`,
+    `\`${PREFIX}aichat\` — create (or open) your own private chat channel with the AI. Only you can type there, and by default only you can even see it — this can be changed with the "Visible to everyone" setting in the pinned settings panel. This channel gets its own memory database in addition to your global facts`,
+    `\`${PREFIX}settings\` — re-post/jump to your pinned settings panel for this channel`,
     '',
     `You can also **mention the bot** (\`@SjpHelper\`) or **reply to one of its messages** with a question, any time.`,
     '',
-    `I'll also notice if you go quiet mid-conversation and check in, and I'll greet you properly when you come back.`,
     `And if we've been talking in voice chat together, I can relay things the voice-AI needs from you right here.`,
 ].join('\n');
 
@@ -1370,6 +1377,14 @@ function requireDb(message) {
 }
 function isPrivateAiChannelFor(message) {
     return message.channel.topic === `private-ai-chat:${message.author.id}`;
+}
+// Any private AI channel at all (owned by anyone) — used to decide whether
+// a *visitor* (not the owner) should be allowed to passively read replies
+// without triggering their own AI turn. Visitors can never type here since
+// SendMessages stays denied for @everyone regardless of visibility.
+function privateAiChannelOwnerId(channel) {
+    const m = /^private-ai-chat:(\d+)$/.exec(channel?.topic || '');
+    return m ? m[1] : null;
 }
 
 const VOICE_BOT_COMMANDS = new Set(['voice', 'join', 'leave']);
@@ -1570,9 +1585,16 @@ async function handleSlashLikeCommand(message) {
             const { channel, created } = await createOrGetPrivateChatChannel(message.guild, message.member);
             return message.reply(
                 created
-                    ? `✅ Created your private AI chat channel: ${channel}. Everyone in the server can still see it, but only you can send messages there — every message you send there is automatically treated as a message to me, no mention needed. This channel also gets its own memory database (\`${PREFIX}channelmemory\`), separate from but layered with your global facts.`
+                    ? `✅ Created your private AI chat channel: ${channel}. Only you can send messages there — no mention needed, every message you send is treated as talking to me. By default only you can even see it; use the pinned ⚙️ settings panel there to make it visible to everyone (read-only for others) if you want. This channel also gets its own memory database (\`${PREFIX}channelmemory\`), separate from but layered with your global facts.`
                     : `You already have a private AI chat channel: ${channel}`
             );
+        }
+        case 'settings': {
+            if (!requireDb(message)) return;
+            if (!isPrivateAiChannelFor(message)) return message.reply('This command only works inside your own private AI chat channel.');
+            const sent = await postOrRefreshSettingsEmbed(message.channel, message.author.id, message.guildId);
+            if (sent && sent.id !== message.id) return; // already posted/edited in place, nothing else to say
+            return;
         }
         default: {
             if (VOICE_BOT_COMMANDS.has(cmd)) return; // Belongs to the separate voice bot — stay silent.
@@ -1599,33 +1621,34 @@ function splitIntoChunks(text, maxLen = CHUNK_SIZE) {
     return chunks;
 }
 
-async function sendLongReply(message, text) {
+// Delivers a (possibly long) final reply into a message that was already
+// sent as the "Thinking for {user}..." placeholder. The first chunk edits
+// that placeholder in place; any overflow chunks are sent as normal
+// follow-up messages in the channel, same as the old multi-chunk behavior.
+async function deliverReplyViaThinkingMessage(thinkingMessage, message, text) {
     const safeText = text && text.trim() ? text : '(no response)';
-    if (safeText.length <= DISCORD_MAX_LEN) {
-        await message.reply(safeText);
-        return;
-    }
     const chunks = splitIntoChunks(safeText);
-    for (let i = 0; i < chunks.length; i++) {
+    try {
+        await thinkingMessage.edit(chunks[0]);
+    } catch (e) {
+        console.error('Failed to edit thinking message, falling back to a fresh reply:', e.message);
+        try { await message.reply(chunks[0]); } catch (_) { /* give up quietly */ }
+    }
+    for (let i = 1; i < chunks.length; i++) {
         try {
-            if (i === 0) {
-                await message.reply(chunks[i]);
-            } else {
-                await message.channel.send(chunks[i]);
-            }
+            await message.channel.send(chunks[i]);
         } catch (e) {
             console.error(`Failed to send chunk ${i + 1}/${chunks.length}:`, e.message);
             try {
                 await message.channel.send(`⚠️ (part ${i + 1} of my reply failed to send: ${e.message})`);
-            } catch (_) { /* give up quietly if even the error notice fails */ }
+            } catch (_) { /* give up quietly */ }
         }
         if (i < chunks.length - 1) await new Promise((res) => setTimeout(res, 350));
     }
 }
 
 // ============================================================
-// 12. Voice bridge polling (idle-checkin/presence-sweep system removed —
-//    the bot no longer proactively messages users who go quiet)
+// 12. Voice bridge polling
 // ============================================================
 setInterval(() => { pollBridgeForVoiceRequests().catch((e) => console.error('bridge poll crashed:', e.message)); }, BRIDGE_POLL_INTERVAL_MS);
 
@@ -1634,6 +1657,96 @@ setInterval(() => { pollBridgeForVoiceRequests().catch((e) => console.error('bri
 // ============================================================
 client.once('ready', () => {
     console.log(`Bot logged in successfully as: ${client.user.tag} 🚀`);
+});
+
+// ------------------------------------------------------------
+// Settings-panel button interactions
+// ------------------------------------------------------------
+client.on('interactionCreate', async (interaction) => {
+    if (interaction.isButton() && interaction.customId.startsWith('cs:')) {
+        try {
+            if (!dbEnabled()) return interaction.reply({ content: '⚠️ The knowledge database is not configured yet.', ephemeral: true });
+            const ownerId = privateAiChannelOwnerId(interaction.channel);
+            if (!ownerId) return interaction.reply({ content: 'This panel only works inside a private AI chat channel.', ephemeral: true });
+            if (interaction.user.id !== ownerId) {
+                return interaction.reply({ content: '⛔ Only the owner of this private AI channel can change its settings.', ephemeral: true });
+            }
+
+            const [, action, field] = interaction.customId.split(':');
+            let settings = await dbGetChannelSettings(interaction.channelId, ownerId, interaction.guildId);
+
+            if (action === 'toggle') {
+                const patch = { [field]: !settings[field] };
+                settings = await dbUpdateChannelSettings(interaction.channelId, patch);
+                if (field === 'visible_to_everyone') {
+                    await applyChannelVisibility(interaction.channel, settings.visible_to_everyone);
+                }
+            } else if (action === 'cycle') {
+                if (field === 'verbosity') {
+                    const idx = VERBOSITY_CYCLE.indexOf(settings.verbosity);
+                    const next = VERBOSITY_CYCLE[(idx + 1) % VERBOSITY_CYCLE.length];
+                    settings = await dbUpdateChannelSettings(interaction.channelId, { verbosity: next });
+                } else if (field === 'language_lock') {
+                    const idx = LANGUAGE_CYCLE.indexOf(settings.language_lock);
+                    const next = LANGUAGE_CYCLE[(idx + 1) % LANGUAGE_CYCLE.length];
+                    settings = await dbUpdateChannelSettings(interaction.channelId, { language_lock: next });
+                }
+            } else if (action === 'persona' && field === 'clear') {
+                settings = await dbUpdateChannelSettings(interaction.channelId, { persona_override: null });
+            } else if (action === 'persona' && field === 'edit') {
+                const modal = new ModalBuilder().setCustomId('cs-persona-modal').setTitle('Persona override for this channel');
+                const input = new TextInputBuilder()
+                    .setCustomId('persona_text')
+                    .setLabel('How should the AI act in this channel?')
+                    .setStyle(TextInputStyle.Paragraph)
+                    .setPlaceholder('Leave blank + submit to clear the override.')
+                    .setValue(settings.persona_override || '')
+                    .setRequired(false)
+                    .setMaxLength(1000);
+                modal.addComponents(new ActionRowBuilder().addComponents(input));
+                return interaction.showModal(modal);
+            } else if (action === 'reset') {
+                settings = await dbUpdateChannelSettings(interaction.channelId, { ...DEFAULT_CHANNEL_SETTINGS });
+                await applyChannelVisibility(interaction.channel, DEFAULT_CHANNEL_SETTINGS.visible_to_everyone);
+            } else if (action === 'refresh') {
+                // no-op patch, just re-render below
+            }
+
+            const embed = buildSettingsEmbed(settings, { id: ownerId });
+            const components = buildSettingsButtonRows(settings);
+            await interaction.update({ embeds: [embed], components });
+        } catch (e) {
+            console.error('Settings button interaction failed:', e.message);
+            try {
+                if (interaction.deferred || interaction.replied) {
+                    await interaction.followUp({ content: `⚠️ Something went wrong: ${e.message}`, ephemeral: true });
+                } else {
+                    await interaction.reply({ content: `⚠️ Something went wrong: ${e.message}`, ephemeral: true });
+                }
+            } catch (_) { /* give up quietly */ }
+        }
+        return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'cs-persona-modal') {
+        try {
+            if (!dbEnabled()) return interaction.reply({ content: '⚠️ The knowledge database is not configured yet.', ephemeral: true });
+            const ownerId = privateAiChannelOwnerId(interaction.channel);
+            if (!ownerId || interaction.user.id !== ownerId) {
+                return interaction.reply({ content: '⛔ Only the owner of this private AI channel can change its settings.', ephemeral: true });
+            }
+            const text = interaction.fields.getTextInputValue('persona_text').trim();
+            const settings = await dbUpdateChannelSettings(interaction.channelId, { persona_override: text || null });
+            const embed = buildSettingsEmbed(settings, { id: ownerId });
+            const components = buildSettingsButtonRows(settings);
+            const settingsMsg = await interaction.channel.messages.fetch(settings.settings_message_id).catch(() => null);
+            if (settingsMsg) await settingsMsg.edit({ embeds: [embed], components });
+            await interaction.reply({ content: text ? '✅ Persona override updated.' : '✅ Persona override cleared.', ephemeral: true });
+        } catch (e) {
+            console.error('Persona modal submit failed:', e.message);
+            try { await interaction.reply({ content: `⚠️ Something went wrong: ${e.message}`, ephemeral: true }); } catch (_) {}
+        }
+    }
 });
 
 client.on('messageCreate', async (message) => {
@@ -1650,6 +1763,15 @@ client.on('messageCreate', async (message) => {
     }
 
     const isPrivateAiChannel = isPrivateAiChannelFor(message);
+
+    // Visitors browsing someone else's now-visible-to-everyone private AI
+    // channel: they can never type there (SendMessages stays denied for
+    // @everyone), so in practice this branch won't fire for them — but guard
+    // anyway in case permissions get out of sync, so the AI never answers a
+    // stranger inside someone else's private memory space.
+    const ownerIdOfThisChannel = privateAiChannelOwnerId(message.channel);
+    if (ownerIdOfThisChannel && ownerIdOfThisChannel !== message.author.id) return;
+
     const repliedToBotMessage = await getRepliedToBotMessage(message);
     if (!message.mentions.has(client.user) && !isPrivateAiChannel && !repliedToBotMessage) return;
 
@@ -1670,6 +1792,17 @@ client.on('messageCreate', async (message) => {
         return message.reply(`Hi! What can I help you with today? (Type \`${PREFIX}help\` for the command list)`);
     }
 
+    // "Thinking for {user}..." placeholder — sent immediately, edited in
+    // place once the real answer is ready. Gives instant feedback instead
+    // of a silent typing indicator, and doubles as visible progress if
+    // something goes wrong (the edit/catch below still updates it).
+    let thinkingMessage = null;
+    try {
+        thinkingMessage = await message.reply(`🤔 Thinking for **${message.member?.displayName || message.author.username}**...`);
+    } catch (e) {
+        console.error('Could not send thinking placeholder (non-fatal):', e.message);
+    }
+
     try {
         await message.channel.sendTyping();
 
@@ -1681,11 +1814,17 @@ client.on('messageCreate', async (message) => {
         const isCode = looksLikeCode(cleanPrompt);
         const history = getChannelHistory(channelId);
 
-        // NOTE: idle-checkin / "welcome back" presence tracking was removed —
-        // the bot no longer proactively comments on gaps in conversation or
-        // sends unsolicited "you still there?" messages. presenceNote is now
-        // used ONLY for the voice-bridge acknowledgment note below.
-        let presenceNote = null;
+        const settings = isPrivateAiChannel
+            ? await dbGetChannelSettings(channelId, message.author.id, message.guildId)
+            : { ...DEFAULT_CHANNEL_SETTINGS };
+
+        // Auto-learn toggle: if the owner turned this off for their private
+        // channel, skip the whole learnAndStore step below for this turn.
+        const autoLearnEnabled = !isPrivateAiChannel || settings.auto_learn;
+
+        // Allow-tools toggle: if off, general users in their own private
+        // channel get plain chat instead of tool-calling for this turn.
+        const toolsAllowed = !isPrivateAiChannel || settings.allow_tools;
 
         let bridgeNote = null;
         if (dbEnabled() && message.guildId) {
@@ -1716,12 +1855,8 @@ client.on('messageCreate', async (message) => {
                 console.error('voice-bridge fulfillment check failed (non-fatal):', e.message);
             }
         }
-        if (bridgeNote) presenceNote = presenceNote ? `${presenceNote}\n\n${bridgeNote}` : bridgeNote;
 
         // Retrieval-augmented context: search the whole library before answering.
-        // Now uses full-text search and always runs (even for images, using
-        // whatever caption text came with them) since this IS the bot's memory,
-        // not just a bonus for the tool-calling path.
         let retrieved = { facts: [], channelMemory: [], knowledge: [] };
         if (!hasImages || cleanPrompt) {
             const [facts, channelMem, knowledge] = await Promise.all([
@@ -1731,7 +1866,8 @@ client.on('messageCreate', async (message) => {
             ]);
             retrieved = { facts, channelMemory: channelMem, knowledge };
         }
-        const systemPrompt = await buildSystemPrompt(message.guildId, message.author.id, channelId, isPrivateAiChannel, isAdmin, retrieved, presenceNote);
+        let systemPrompt = await buildSystemPrompt(message.guildId, message.author.id, channelId, isPrivateAiChannel, isAdmin, retrieved, settings);
+        if (bridgeNote) systemPrompt += `\n\n${bridgeNote}`;
 
         let botReply;
         let providerUsed;
@@ -1740,15 +1876,10 @@ client.on('messageCreate', async (message) => {
             const result = await getVisionReply(systemPrompt, history, cleanPrompt, imageUrls);
             botReply = result.text;
             providerUsed = result.provider;
-        } else if (isAdmin || isCode || dbEnabled()) {
-            // NOTE: general users now also get tool access (search_knowledge/
-            // remember_fact) whenever the DB is enabled, not just Admins/code
-            // questions — this is the "focus more on database" change: every
-            // eligible message can actively search/save memory, not only the
-            // narrow set of cases that used to trigger tool-calling.
+        } else if (toolsAllowed && (isAdmin || isCode || dbEnabled())) {
             let messages = [{ role: 'system', content: systemPrompt }, ...history, { role: 'user', content: cleanPrompt }];
             const activeTools = isAdmin ? [...knowledgeTools, ...adminTools] : knowledgeTools;
-            const ctx = { guild: message.guild, userId: message.author.id, guildId: message.guildId, channelId, isPrivateAiChannel, isAdmin };
+            const ctx = { guild: message.guild, userId: message.author.id, guildId: message.guildId, channelId, isPrivateAiChannel, isAdmin, settings };
 
             let response = await mistral.chat.complete({
                 model: TEXT_MODEL,
@@ -1813,14 +1944,33 @@ client.on('messageCreate', async (message) => {
 
         user.msgCount += 1;
         saveStoreSoon();
-        // Fire-and-forget: decide what (if anything) is worth remembering long-term,
-        // and file it onto the correct shelf (global / this-channel / server-wide).
-        learnAndStore(message.author.id, message.guildId, channelId, isPrivateAiChannel, isAdmin, cleanPrompt, history);
 
-        await sendLongReply(message, botReply);
+        if (autoLearnEnabled) {
+            // Fire-and-forget: decide what (if anything) is worth remembering
+            // long-term, filed onto the correct shelf. Skipped entirely if the
+            // channel owner has turned auto-learn off for this private channel.
+            learnAndStore(message.author.id, message.guildId, channelId, isPrivateAiChannel, isAdmin, cleanPrompt, history);
+        }
+
+        if (thinkingMessage) {
+            await deliverReplyViaThinkingMessage(thinkingMessage, message, botReply);
+        } else {
+            // Placeholder failed to send earlier (rare) — fall back to a normal reply chain.
+            const chunks = splitIntoChunks(botReply && botReply.trim() ? botReply : '(no response)');
+            for (let i = 0; i < chunks.length; i++) {
+                if (i === 0) await message.reply(chunks[i]);
+                else await message.channel.send(chunks[i]);
+                if (i < chunks.length - 1) await new Promise((res) => setTimeout(res, 350));
+            }
+        }
     } catch (error) {
         console.error('Execution Error:', error?.body || error?.rawValue || error);
-        await message.reply('Something went wrong connecting to the AI. Please try again in a moment!').catch(() => {});
+        const errText = 'Something went wrong connecting to the AI. Please try again in a moment!';
+        if (thinkingMessage) {
+            await thinkingMessage.edit(errText).catch(() => {});
+        } else {
+            await message.reply(errText).catch(() => {});
+        }
     }
 });
 
