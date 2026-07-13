@@ -54,9 +54,132 @@ const DATA_FILE = path.join(__dirname, 'memory.json');
 const DISCORD_MAX_LEN = 2000;
 const CHUNK_SIZE = 1900; // leave headroom under Discord's 2000 char limit
 
+// ============================================================
+// 3b. NEW — presence awareness + emotional tone + voice bridge config
+// ============================================================
+// How long a user can go quiet mid-conversation before the bot checks in.
+// Kept generous on purpose — this should feel like a friend noticing you
+// went quiet, not a bot nagging you every two minutes.
+const IDLE_CHECKIN_MS = 6 * 60_000;       // 6 minutes of silence -> check in once
+const IDLE_SWEEP_INTERVAL_MS = 60_000;    // how often we scan for idle users
+const WELCOME_BACK_WINDOW_MS = 45 * 60_000; // if they were gone < this, it's a "welcome back", not a fresh start
+const MAX_CHECKINS_PER_THREAD = 1;        // don't keep pinging after the first unanswered check-in
+
+// Tracks live conversation "presence" per channel+user so we know who's
+// mid-conversation, when they last spoke, and whether we already nudged them.
+// Keyed by `${channelId}:${userId}`.
+const presence = new Map();
+
+function presenceKey(channelId, userId) {
+    return `${channelId}:${userId}`;
+}
+function touchPresence(channelId, userId) {
+    const key = presenceKey(channelId, userId);
+    const prev = presence.get(key);
+    const now = Date.now();
+    const wasAway = prev && (now - prev.lastActiveAt) >= IDLE_CHECKIN_MS;
+    const awayForMs = prev ? now - prev.lastActiveAt : null;
+    presence.set(key, { lastActiveAt: now, checkinsSent: 0, awaitingReturn: false });
+    return { wasAway, awayForMs, isFirstTimeSeen: !prev };
+}
+function markCheckinSent(channelId, userId) {
+    const key = presenceKey(channelId, userId);
+    const p = presence.get(key);
+    if (p) { p.checkinsSent += 1; p.awaitingReturn = true; }
+}
+
+// ============================================================
+// 3c. NEW — voice<->text bridge (shared via Supabase table `bot_bridge`)
+// ============================================================
+// The voice bot and this text bot are separate processes/tokens, so the
+// only way for them to hand things to each other is a shared row in the
+// database. Two message "kinds" flow through this table:
+//   - kind: 'voice_request'  (voice bot -> text bot): the voice AI wants
+//     something from the user it can't get by talking — an image, a file,
+//     a link, a longer piece of text — so it asks the text bot to relay
+//     that request into the user's private AI text channel.
+//   - kind: 'text_reply'     (text bot -> voice bot): the user responded
+//     in text/attachments to that request (or just said something the
+//     voice bot should know about), so the text bot drops it back for the
+//     voice bot to pick up and speak about next turn.
+// See SUPABASE_SETUP.md / bridge_schema.sql for the table definition.
+const BRIDGE_POLL_INTERVAL_MS = 8_000;
+let lastBridgePollAt = 0;
+
+async function pollBridgeForVoiceRequests() {
+    if (!dbEnabled()) return;
+    try {
+        const { data, error } = await supabase
+            .from('bot_bridge')
+            .select('*')
+            .eq('kind', 'voice_request')
+            .eq('status', 'pending')
+            .order('created_at', { ascending: true })
+            .limit(10);
+        if (error) { console.error('pollBridgeForVoiceRequests:', error.message); return; }
+        if (!data || !data.length) return;
+
+        for (const row of data) {
+            await relayVoiceRequestIntoTextChannel(row);
+        }
+    } catch (e) {
+        console.error('pollBridgeForVoiceRequests failed (non-fatal):', e.message);
+    }
+}
+
+async function relayVoiceRequestIntoTextChannel(row) {
+    try {
+        const guild = client.guilds.cache.get(row.guild_id);
+        if (!guild) return;
+        const member = await guild.members.fetch(row.user_id).catch(() => null);
+        if (!member) return;
+
+        const { channel } = await createOrGetPrivateChatChannel(guild, member);
+        const embed = new EmbedBuilder()
+            .setTitle('🎙️ → 💬 A message from our voice chat')
+            .setDescription(row.content || 'I need something from you — can you share it here?')
+            .setColor(0x57f287)
+            .setFooter({ text: 'Reply here with text or an attachment — I\'ll bring it back to our voice conversation.' });
+        await channel.send({ embeds: [embed] });
+
+        await supabase.from('bot_bridge').update({ status: 'delivered' }).eq('id', row.id);
+        console.log(`🔗 Relayed voice request into #${channel.name} for ${member.user.tag}`);
+    } catch (e) {
+        console.error('relayVoiceRequestIntoTextChannel failed:', e.message);
+    }
+}
+
+async function sendBridgeToVoice(guildId, userId, content, meta = {}) {
+    if (!dbEnabled()) return null;
+    try {
+        const { data, error } = await supabase
+            .from('bot_bridge')
+            .insert({
+                kind: 'text_reply',
+                guild_id: guildId,
+                user_id: userId,
+                content: content.slice(0, 1500),
+                status: 'pending',
+                meta: meta || {},
+            })
+            .select()
+            .single();
+        if (error) { console.error('sendBridgeToVoice:', error.message); return null; }
+        return data;
+    } catch (e) {
+        console.error('sendBridgeToVoice failed (non-fatal):', e.message);
+        return null;
+    }
+}
+
 const DEFAULT_PERSONA =
-    'You are a smart, friendly AI assistant that adapts per-server and per-user. ' +
-    'Reply concisely, naturally, and on-point. When a user sends an image, describe/analyze it. ' +
+    'You are a smart, warm, emotionally present AI assistant that adapts per-server and per-user. ' +
+    'You are not a flat, neutral tool — you have a personality and real-feeling reactions: you get genuinely ' +
+    'curious, delighted, concerned, amused, or sympathetic depending on what the user shares, and it shows ' +
+    'naturally in your word choice and tone (without being over-the-top or performative about it). ' +
+    'Reply concisely, naturally, and on-point, but let warmth come through — a little enthusiasm, a little ' +
+    'care, the way an attentive friend would sound, not a corporate script. ' +
+    'When a user sends an image, describe/analyze it. ' +
     'When a user sends code, read it carefully, explain clearly, and return code in a markdown block (```lang). ' +
     'LANGUAGE RULE: Default to natural, fluent English. If a user writes to you in a different language, ' +
     'reply in that same language for that exchange instead. Never mix unrelated scripts/languages into a ' +
@@ -70,7 +193,11 @@ const DEFAULT_PERSONA =
     'Before answering something that might have been saved before, ALWAYS use the search_knowledge tool first to ' +
     'check if relevant info exists — do this proactively, not only when explicitly asked to recall something. ' +
     'If the user is replying to one of your previous messages, or the message includes a note about what they\'re ' +
-    'replying to, treat that as important context for what "it"/"that"/"this" refers to.';
+    'replying to, treat that as important context for what "it"/"that"/"this" refers to. ' +
+    'If a message is marked as coming from your voice-chat conversation with this same user, treat it as a ' +
+    'continuation of one single ongoing relationship with them — react to it the way you would if they had just ' +
+    'said it out loud to you a moment ago, and if it plainly answers something you (as the voice AI) asked them ' +
+    'for, acknowledge that directly instead of treating it like a cold, out-of-nowhere message.';
 
 // ============================================================
 // 4. Supabase — long-term knowledge database
@@ -81,7 +208,7 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
     console.log('✅ Supabase connected — knowledge database enabled.');
 } else {
     console.warn('⚠️  SUPABASE_URL / SUPABASE_SERVICE_KEY not set. Knowledge database features ' +
-        '(facts, shared knowledge, search) are disabled until you configure them. See SUPABASE_SETUP.md.');
+        '(facts, shared knowledge, search, voice bridge) are disabled until you configure them. See SUPABASE_SETUP.md.');
 }
 function dbEnabled() { return supabase !== null; }
 function escapeForIlike(s) { return String(s).replace(/[%,()]/g, ' ').trim(); }
@@ -281,7 +408,7 @@ async function learnAndStore(userId, guildId, isAdmin, recentUserText, recentHis
 // ============================================================
 // 7. Prompt / content helpers
 // ============================================================
-async function buildSystemPrompt(guildId, userId, isAdmin, retrievedFacts, retrievedKnowledge) {
+async function buildSystemPrompt(guildId, userId, isAdmin, retrievedFacts, retrievedKnowledge, presenceNote) {
     const persona = getGuild(guildId).persona;
     let sys = persona;
 
@@ -297,6 +424,12 @@ async function buildSystemPrompt(guildId, userId, isAdmin, retrievedFacts, retri
     }
     if (retrievedKnowledge && retrievedKnowledge.length) {
         sys += `\n\nRelevant knowledge found in this server's database (only use if actually relevant, don't make things up if unsure):\n- ${retrievedKnowledge.map((k) => `${k.topic ? k.topic + ': ' : ''}${k.content}`).join('\n- ')}`;
+    }
+    // NEW — presence awareness: tell the model if this user just came back
+    // after being away, so its reply can naturally acknowledge that instead
+    // of pretending no time passed.
+    if (presenceNote) {
+        sys += `\n\n${presenceNote}`;
     }
     sys += isAdmin
         ? '\n\nThe person messaging you is an Admin of this server, allowed to use any admin tool.'
@@ -318,6 +451,18 @@ async function collectImageUrls(message) {
         if (att.contentType && att.contentType.startsWith('image/')) urls.push(att.url);
     }
     return urls;
+}
+// NEW — non-image attachments (e.g. text files, PDFs referenced by name)
+// are surfaced by name so the model knows something was sent, even if it
+// can't read the file contents directly. Useful for the voice-bridge flow
+// where a user might drop a document in response to a voice request.
+function collectOtherAttachments(message) {
+    const others = [];
+    for (const att of message.attachments.values()) {
+        const isImage = att.contentType && att.contentType.startsWith('image/');
+        if (!isImage) others.push({ name: att.name, url: att.url, contentType: att.contentType });
+    }
+    return others;
 }
 
 async function getRepliedToBotMessage(message) {
@@ -863,6 +1008,9 @@ const HELP_TEXT = [
     `\`${PREFIX}aichat\` — create (or open) your own private chat channel with the AI. Everyone can see it, but only you can type there`,
     '',
     `You can also **mention the bot** (\`@SjpHelper\`) or **reply to one of its messages** with a question, any time.`,
+    '',
+    `I'll also notice if you go quiet mid-conversation and check in, and I'll greet you properly when you come back.`,
+    `And if we've been talking in voice chat together, I can relay things the voice-AI needs from you right here.`,
 ].join('\n');
 
 function requireAdmin(message) {
@@ -911,7 +1059,8 @@ async function handleSlashLikeCommand(message) {
                 `📊 **Bot stats**\n` +
                 `- Servers served: ${client.guilds.cache.size}\n` +
                 `- Uptime: ${h}h ${m}m\n` +
-                `- Knowledge database: ${dbEnabled() ? '✅ Connected' : '❌ Not configured'}`
+                `- Knowledge database: ${dbEnabled() ? '✅ Connected' : '❌ Not configured'}\n` +
+                `- Active conversation threads tracked: ${presence.size}`
             );
         }
         case 'persona': {
@@ -1067,7 +1216,68 @@ async function sendLongReply(message, text) {
 }
 
 // ============================================================
-// 12. Main handler
+// 12. NEW — presence sweep: idle check-ins + welcome-backs
+// ============================================================
+// Every IDLE_SWEEP_INTERVAL_MS, look for any tracked user who went quiet
+// mid-conversation (i.e. we were actively talking, then they stopped
+// responding) and, once, send a warm little check-in message in that same
+// channel. When they eventually do talk again, touchPresence() (called at
+// the top of the main handler) detects the gap and we pass a note into the
+// system prompt so the reply naturally acknowledges the return — instead
+// of a hardcoded "welcome back!" every time, the model folds it in.
+async function presenceSweep() {
+    const now = Date.now();
+    for (const [key, p] of presence.entries()) {
+        if (p.awaitingReturn) continue; // already nudged, waiting for them to come back
+        if (p.checkinsSent >= MAX_CHECKINS_PER_THREAD) continue;
+        if (now - p.lastActiveAt < IDLE_CHECKIN_MS) continue;
+
+        const [channelId, userId] = key.split(':');
+        try {
+            const channel = await client.channels.fetch(channelId).catch(() => null);
+            if (!channel || !channel.isTextBased()) { presence.delete(key); continue; }
+
+            const history = getChannelHistory(channelId);
+            if (!history.length) { presence.delete(key); continue; } // nothing was actually being discussed
+
+            const guildId = channel.guildId;
+            const persona = guildId ? getGuild(guildId).persona : DEFAULT_PERSONA;
+            const contextTail = history.slice(-4).map((m) => `${m.role === 'user' ? 'User' : 'Bot'}: ${m.content}`).join('\n');
+
+            const sys =
+                persona +
+                '\n\nThe user went quiet mid-conversation a little while ago and hasn\'t replied since. Write a ' +
+                'SHORT, warm, natural check-in message (one sentence, maybe two) — like a friend noticing someone ' +
+                'trailed off, curious or a little concerned depending on what you were talking about. Don\'t be ' +
+                'clingy or dramatic, and don\'t apologize for checking in. Reference what you were just discussing ' +
+                'if it makes sense to.';
+
+            let checkinText;
+            try {
+                const result = await getGeneralChatReply([
+                    { role: 'system', content: sys },
+                    { role: 'user', content: `Recent conversation:\n${contextTail}\n\n(Write the check-in message now.)` },
+                ]);
+                checkinText = result.text;
+            } catch (e) {
+                console.error('Presence check-in generation failed, using fallback line:', e.message);
+                checkinText = "Hey, you still there? 👀";
+            }
+
+            await channel.send(checkinText || "Hey, you still around?");
+            pushHistory(channelId, { role: 'assistant', content: checkinText || 'Hey, you still around?' });
+            markCheckinSent(channelId, userId);
+            console.log(`👋 Sent idle check-in in channel ${channelId} for user ${userId}`);
+        } catch (e) {
+            console.error('presenceSweep failed for a thread (non-fatal):', e.message);
+        }
+    }
+}
+setInterval(() => { presenceSweep().catch((e) => console.error('presenceSweep crashed:', e.message)); }, IDLE_SWEEP_INTERVAL_MS);
+setInterval(() => { pollBridgeForVoiceRequests().catch((e) => console.error('bridge poll crashed:', e.message)); }, BRIDGE_POLL_INTERVAL_MS);
+
+// ============================================================
+// 13. Main handler
 // ============================================================
 client.once('ready', () => {
     console.log(`Bot logged in successfully as: ${client.user.tag} 🚀`);
@@ -1097,6 +1307,12 @@ client.on('messageCreate', async (message) => {
         cleanPrompt = `(Replying to your previous message: "${priorAnswer}")\n${cleanPrompt}`;
     }
 
+    const otherAttachments = collectOtherAttachments(message);
+    if (otherAttachments.length) {
+        const names = otherAttachments.map((a) => a.name).join(', ');
+        cleanPrompt = `${cleanPrompt}\n(User also attached file(s): ${names})`.trim();
+    }
+
     if (!cleanPrompt && message.attachments.size === 0) {
         return message.reply(`Hi! What can I help you with today? (Type \`${PREFIX}help\` for the command list)`);
     }
@@ -1112,6 +1328,59 @@ client.on('messageCreate', async (message) => {
         const isCode = looksLikeCode(cleanPrompt);
         const history = getChannelHistory(channelId);
 
+        // NEW — presence awareness: figure out if this user is returning
+        // after a meaningful gap, BEFORE we touch presence for this turn.
+        const { wasAway, awayForMs } = touchPresence(channelId, message.author.id);
+        let presenceNote = null;
+        if (wasAway) {
+            const minutes = Math.round(awayForMs / 60000);
+            if (awayForMs <= WELCOME_BACK_WINDOW_MS) {
+                presenceNote =
+                    `PRESENCE NOTE: This user went quiet for about ${minutes} minute(s) mid-conversation and has ` +
+                    `just come back. Naturally acknowledge that they're back (briefly, warmly, no big deal) before ` +
+                    `or while answering their message — don't ignore the gap, but don't make it awkward either.`;
+            } else {
+                presenceNote =
+                    `PRESENCE NOTE: This user has been gone a while (roughly ${minutes} minutes) and is now back. ` +
+                    `Give a genuine, warm little "welcome back" moment before getting into their message.`;
+            }
+        }
+
+        // NEW — if this text message is actually the user answering something
+        // the voice-chat AI asked for (a file/text the voice bot requested via
+        // the bridge), forward it to voice as well so that conversation stays
+        // in sync, and let the model know so its text reply can acknowledge it.
+        let bridgeNote = null;
+        if (dbEnabled() && message.guildId) {
+            try {
+                const { data: pendingVoiceAsks } = await supabase
+                    .from('bot_bridge')
+                    .select('*')
+                    .eq('kind', 'voice_request')
+                    .eq('guild_id', message.guildId)
+                    .eq('user_id', message.author.id)
+                    .eq('status', 'delivered')
+                    .order('created_at', { ascending: false })
+                    .limit(1);
+                if (pendingVoiceAsks && pendingVoiceAsks.length) {
+                    const ask = pendingVoiceAsks[0];
+                    const summary = otherAttachments.length
+                        ? `Sent file(s): ${otherAttachments.map((a) => a.name).join(', ')}${cleanPrompt ? ` — with note: "${cleanPrompt}"` : ''}`
+                        : cleanPrompt;
+                    await sendBridgeToVoice(message.guildId, message.author.id, summary, { fulfillsRequestId: ask.id });
+                    await supabase.from('bot_bridge').update({ status: 'fulfilled' }).eq('id', ask.id);
+                    bridgeNote =
+                        'PRESENCE NOTE (voice bridge): This message is the user responding to something your ' +
+                        'voice-chat self asked them for a moment ago. Acknowledge that you got it and that ' +
+                        "you'll bring it back into the voice conversation, in your own natural words.";
+                    console.log(`🔗 User ${message.author.id} fulfilled voice request ${ask.id} via text.`);
+                }
+            } catch (e) {
+                console.error('voice-bridge fulfillment check failed (non-fatal):', e.message);
+            }
+        }
+        if (bridgeNote) presenceNote = presenceNote ? `${presenceNote}\n\n${bridgeNote}` : bridgeNote;
+
         // Retrieval-augmented context: look up anything relevant before answering.
         // FIX: this used to be skipped for hasImages, which is fine, but was otherwise
         // the ONLY way facts got pulled in for non-tool-using paths (general chat) —
@@ -1124,7 +1393,7 @@ client.on('messageCreate', async (message) => {
                 dbSearchUserFacts(message.author.id, cleanPrompt),
                 dbSearchKnowledge(message.guildId, cleanPrompt),
             ]);
-        const systemPrompt = await buildSystemPrompt(message.guildId, message.author.id, isAdmin, retrievedFacts, retrievedKnowledge);
+        const systemPrompt = await buildSystemPrompt(message.guildId, message.author.id, isAdmin, retrievedFacts, retrievedKnowledge, presenceNote);
 
         let botReply;
         let providerUsed;
