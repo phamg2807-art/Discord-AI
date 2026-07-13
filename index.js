@@ -878,6 +878,16 @@ function requireDb(message) {
     return true;
 }
 
+// FIX: this text bot and the separate Local voice bot both listen for the
+// same "-" prefix in the same channels. This bot has no voice functionality
+// at all, so any "-voice ..." (or bare "-join"/"-leave") command is meant
+// for the OTHER bot. Previously this bot's default case still replied
+// "Unknown command" to those, which showed up as a confusing duplicate/
+// conflicting reply right next to the voice bot's real response. Now it
+// silently ignores commands that clearly belong to the voice bot instead
+// of responding at all.
+const VOICE_BOT_COMMANDS = new Set(['voice', 'join', 'leave']);
+
 async function handleSlashLikeCommand(message) {
     const raw = message.content.slice(PREFIX.length).trim();
     const spaceIdx = raw.indexOf(' ');
@@ -993,8 +1003,10 @@ async function handleSlashLikeCommand(message) {
                     : `You already have a private AI chat channel: ${channel}`
             );
         }
-        default:
+        default: {
+            if (VOICE_BOT_COMMANDS.has(cmd)) return; // Belongs to the separate voice bot — stay silent.
             return message.reply(`Unknown command \`${PREFIX}${cmd}\`. Type \`${PREFIX}help\` for the command list.`);
+        }
     }
 }
 
