@@ -385,17 +385,20 @@ async function dbGetChannelSettings(channelId, userId, guildId) {
 }
 
 async function dbUpdateChannelSettings(channelId, patch) {
-    if (!dbEnabled()) return null;
+    if (!dbEnabled()) return { ok: false, settings: null, error: 'db_disabled' };
     const { data, error } = await supabase
         .from('channel_settings')
         .update({ ...patch, updated_at: new Date().toISOString() })
         .eq('channel_id', channelId)
         .select()
         .single();
-    if (error) { console.error('dbUpdateChannelSettings:', error.message); return null; }
+    if (error) {
+        console.error('dbUpdateChannelSettings:', error.message);
+        return { ok: false, settings: null, error: error.message };
+    }
     const merged = { ...DEFAULT_CHANNEL_SETTINGS, ...data };
     channelSettingsCache.set(channelId, { data: merged, fetchedAt: Date.now() });
-    return merged;
+    return { ok: true, settings: merged, error: null };
 }
 
 async function dbSetSettingsMessageId(channelId, messageId) {
@@ -1674,25 +1677,40 @@ client.on('interactionCreate', async (interaction) => {
 
             const [, action, field] = interaction.customId.split(':');
             let settings = await dbGetChannelSettings(interaction.channelId, ownerId, interaction.guildId);
+            let writeFailedMsg = null; // set if a DB write fails, so we can tell the user without crashing
+
+            // Small helper: apply a patch, and on failure keep the LAST KNOWN GOOD
+            // settings (so the panel still renders) while flagging the failure.
+            async function applyPatch(patch) {
+                const result = await dbUpdateChannelSettings(interaction.channelId, patch);
+                if (!result.ok) {
+                    writeFailedMsg =
+                        `⚠️ Couldn't save that change — the database rejected the update ` +
+                        `(${result.error || 'unknown error'}). This usually means the \`channel_settings\` table ` +
+                        `is missing a column. Ask whoever runs the bot to check the required schema.`;
+                    return settings; // keep whatever we had before, don't null out
+                }
+                return result.settings;
+            }
 
             if (action === 'toggle') {
                 const patch = { [field]: !settings[field] };
-                settings = await dbUpdateChannelSettings(interaction.channelId, patch);
-                if (field === 'visible_to_everyone') {
+                settings = await applyPatch(patch);
+                if (field === 'visible_to_everyone' && !writeFailedMsg) {
                     await applyChannelVisibility(interaction.channel, settings.visible_to_everyone);
                 }
             } else if (action === 'cycle') {
                 if (field === 'verbosity') {
                     const idx = VERBOSITY_CYCLE.indexOf(settings.verbosity);
                     const next = VERBOSITY_CYCLE[(idx + 1) % VERBOSITY_CYCLE.length];
-                    settings = await dbUpdateChannelSettings(interaction.channelId, { verbosity: next });
+                    settings = await applyPatch({ verbosity: next });
                 } else if (field === 'language_lock') {
                     const idx = LANGUAGE_CYCLE.indexOf(settings.language_lock);
                     const next = LANGUAGE_CYCLE[(idx + 1) % LANGUAGE_CYCLE.length];
-                    settings = await dbUpdateChannelSettings(interaction.channelId, { language_lock: next });
+                    settings = await applyPatch({ language_lock: next });
                 }
             } else if (action === 'persona' && field === 'clear') {
-                settings = await dbUpdateChannelSettings(interaction.channelId, { persona_override: null });
+                settings = await applyPatch({ persona_override: null });
             } else if (action === 'persona' && field === 'edit') {
                 const modal = new ModalBuilder().setCustomId('cs-persona-modal').setTitle('Persona override for this channel');
                 const input = new TextInputBuilder()
@@ -1706,8 +1724,8 @@ client.on('interactionCreate', async (interaction) => {
                 modal.addComponents(new ActionRowBuilder().addComponents(input));
                 return interaction.showModal(modal);
             } else if (action === 'reset') {
-                settings = await dbUpdateChannelSettings(interaction.channelId, { ...DEFAULT_CHANNEL_SETTINGS });
-                await applyChannelVisibility(interaction.channel, DEFAULT_CHANNEL_SETTINGS.visible_to_everyone);
+                settings = await applyPatch({ ...DEFAULT_CHANNEL_SETTINGS });
+                if (!writeFailedMsg) await applyChannelVisibility(interaction.channel, DEFAULT_CHANNEL_SETTINGS.visible_to_everyone);
             } else if (action === 'refresh') {
                 // no-op patch, just re-render below
             }
@@ -1715,6 +1733,9 @@ client.on('interactionCreate', async (interaction) => {
             const embed = buildSettingsEmbed(settings, { id: ownerId });
             const components = buildSettingsButtonRows(settings);
             await interaction.update({ embeds: [embed], components });
+            if (writeFailedMsg) {
+                await interaction.followUp({ content: writeFailedMsg, ephemeral: true }).catch(() => {});
+            }
         } catch (e) {
             console.error('Settings button interaction failed:', e.message);
             try {
@@ -1736,10 +1757,16 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.reply({ content: '⛔ Only the owner of this private AI channel can change its settings.', ephemeral: true });
             }
             const text = interaction.fields.getTextInputValue('persona_text').trim();
-            const settings = await dbUpdateChannelSettings(interaction.channelId, { persona_override: text || null });
+            const result = await dbUpdateChannelSettings(interaction.channelId, { persona_override: text || null });
+            if (!result.ok) {
+                return interaction.reply({ content: `⚠️ Couldn't save — the database rejected the update (${result.error || 'unknown error'}).`, ephemeral: true });
+            }
+            const settings = result.settings;
             const embed = buildSettingsEmbed(settings, { id: ownerId });
             const components = buildSettingsButtonRows(settings);
-            const settingsMsg = await interaction.channel.messages.fetch(settings.settings_message_id).catch(() => null);
+            const settingsMsg = settings.settings_message_id
+                ? await interaction.channel.messages.fetch(settings.settings_message_id).catch(() => null)
+                : null;
             if (settingsMsg) await settingsMsg.edit({ embeds: [embed], components });
             await interaction.reply({ content: text ? '✅ Persona override updated.' : '✅ Persona override cleared.', ephemeral: true });
         } catch (e) {
