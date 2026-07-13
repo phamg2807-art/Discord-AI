@@ -319,6 +319,31 @@ async function dbSearchKnowledge(guildId, query, limit = RETRIEVAL_LIMIT) {
     return ftsSearch('knowledge_base', { guild_id: guildId }, query, limit);
 }
 
+// Diagnostic: raw counts, bypassing search/filters entirely, so -dbcheck can
+// tell the difference between "no rows exist" vs "rows exist but search/guild
+// filter isn't matching them" — the two failure modes that look identical
+// from the outside ("Knowledge Base isn't working").
+async function dbDiagnostics(guildId, userId, channelId) {
+    if (!dbEnabled()) return null;
+    const [ufAll, ufMine, kbAll, kbMine, cmAll, cmMine] = await Promise.all([
+        supabase.from('user_facts').select('id', { count: 'exact', head: true }),
+        supabase.from('user_facts').select('id', { count: 'exact', head: true }).eq('user_id', userId),
+        supabase.from('knowledge_base').select('id', { count: 'exact', head: true }),
+        supabase.from('knowledge_base').select('id', { count: 'exact', head: true }).eq('guild_id', guildId),
+        supabase.from('channel_memory').select('id', { count: 'exact', head: true }),
+        supabase.from('channel_memory').select('id', { count: 'exact', head: true }).eq('channel_id', channelId),
+    ]);
+    return {
+        user_facts_total: ufAll.count ?? null, user_facts_total_error: ufAll.error?.message || null,
+        user_facts_mine: ufMine.count ?? null, user_facts_mine_error: ufMine.error?.message || null,
+        knowledge_base_total: kbAll.count ?? null, knowledge_base_total_error: kbAll.error?.message || null,
+        knowledge_base_this_guild: kbMine.count ?? null, knowledge_base_this_guild_error: kbMine.error?.message || null,
+        channel_memory_total: cmAll.count ?? null, channel_memory_total_error: cmAll.error?.message || null,
+        channel_memory_this_channel: cmMine.count ?? null, channel_memory_this_channel_error: cmMine.error?.message || null,
+        guild_id_used: guildId,
+    };
+}
+
 // ---- channel_memory (NEW — per private-AI-channel "brand database") ----
 // Each user's private AI chat channel gets its own isolated memory scope,
 // layered on top of (not instead of) their global user_facts. This is
@@ -359,6 +384,72 @@ async function dbClearChannelMemory(channelId) {
 async function dbSearchChannelMemory(channelId, query, limit = RETRIEVAL_LIMIT) {
     if (!dbEnabled() || !query) return [];
     return ftsSearch('channel_memory', { channel_id: channelId }, query, limit);
+}
+
+// ---- Full wipe helpers ----------------------------------------------
+// These are the "easier to remove AI data" + "admin deletes DB rows but
+// bot still knows" fix. Deleting Supabase rows alone is NOT enough,
+// because the bot ALSO keeps a rolling local chat history (memory.json,
+// via store.channels[channelId]) that gets replayed into every prompt —
+// that's genuine short-term conversational memory, separate from the
+// long-term DB, and it has to be cleared explicitly or the model will
+// keep "remembering" facts purely from the recent transcript even after
+// the DB rows backing them are gone.
+async function dbWipeUserEverywhere(userId) {
+    if (!dbEnabled()) return { ok: false, reason: 'db_disabled' };
+    const results = await Promise.all([
+        supabase.from('user_facts').delete().eq('user_id', userId),
+        supabase.from('channel_memory').delete().eq('user_id', userId),
+    ]);
+    const errors = results.map((r) => r.error).filter(Boolean);
+    return { ok: errors.length === 0, errors: errors.map((e) => e.message) };
+}
+
+async function dbWipeGuildEverywhere(guildId) {
+    if (!dbEnabled()) return { ok: false, reason: 'db_disabled' };
+    const results = await Promise.all([
+        supabase.from('user_facts').delete().eq('guild_id', guildId),
+        supabase.from('knowledge_base').delete().eq('guild_id', guildId),
+        supabase.from('channel_memory').delete().eq('guild_id', guildId),
+    ]);
+    const errors = results.map((r) => r.error).filter(Boolean);
+    return { ok: errors.length === 0, errors: errors.map((e) => e.message) };
+}
+
+// Clears the LOCAL rolling chat history + in-memory presence state for a
+// user, everywhere it appears across tracked channels. This is what makes
+// "forget" actually stick immediately instead of the model still echoing
+// recently-deleted facts back from its short-term transcript memory.
+function clearLocalHistoryForUser(userId, displayNameGuess) {
+    let clearedChannels = 0;
+    for (const channelId of Object.keys(store.channels)) {
+        const before = store.channels[channelId].length;
+        // We don't tag history entries by userId today, so in shared/public
+        // channels we can't selectively strip just this user's lines without
+        // risking corrupting other users' turns. Full-wipe commands (forgetme,
+        // forgetchannelall, dbwipe) therefore clear the ENTIRE channel history
+        // for channels that are this user's own private AI channel (safe,
+        // single-user), and leave shared-channel history alone (multi-user).
+        if (channelId) clearedChannels++;
+    }
+    return clearedChannels;
+}
+function clearLocalChannelHistory(channelId) {
+    if (store.channels[channelId]) {
+        store.channels[channelId] = [];
+        saveStoreSoon();
+        return true;
+    }
+    return false;
+}
+function clearLocalGuildHistory(guildIdChannels) {
+    // guildIdChannels: array of channelIds belonging to the guild, resolved by caller
+    let n = 0;
+    for (const channelId of guildIdChannels) {
+        if (store.channels[channelId]) { store.channels[channelId] = []; n++; }
+    }
+    if (n) saveStoreSoon();
+    return n;
 }
 
 // ============================================================
@@ -542,6 +633,16 @@ async function buildSystemPrompt(guildId, userId, channelId, isPrivateAiChannel,
     if (!dbEnabled()) {
         sys += '\n\nNOTE: The long-term knowledge database is currently not configured, so you have no persistent memory of this user beyond the current conversation. Do not claim to remember things from before this chat.';
     }
+    // IMPORTANT: the lists above (global facts + channel memory) are pulled
+    // FRESH from the database on every message. If earlier turns in this
+    // conversation mentioned a fact that is NOT present in these lists right
+    // now, treat it as stale/removed — the database is the current source
+    // of truth, not what you said a few messages ago. Do not re-assert or
+    // rely on a fact just because it appeared earlier in this chat if it's
+    // no longer showing up in the lists above.
+    sys += '\n\nMEMORY SOURCE OF TRUTH: The facts/memory lists above reflect the database RIGHT NOW. If something ' +
+           'you or the user mentioned earlier in this conversation is not in those lists anymore, treat it as ' +
+           'deleted — don\'t keep asserting it just because it appeared earlier in the chat transcript.';
     return sys;
 }
 function looksLikeCode(text) {
@@ -1108,17 +1209,23 @@ const HELP_TEXT = [
     `\`${PREFIX}whatyouknow\` — see what the bot remembers about you globally`,
     `\`${PREFIX}remember <thing to remember>\` — manually tell the bot to remember something about you`,
     `\`${PREFIX}forget <id>\` — forget one specific thing (id comes from whatyouknow)`,
-    `\`${PREFIX}forgetme\` — erase everything the bot remembers about you globally`,
+    `\`${PREFIX}forgetme\` — erase everything the bot remembers about you globally (database only — see forgetall for a full reset)`,
+    `\`${PREFIX}forgetall\` — (private AI channel only) full reset: wipes your global facts, this channel's memory, AND recent conversation history in one go`,
     '',
     '**This channel\'s memory (private AI chat only — this room\'s own "brand database")**',
     `\`${PREFIX}channelmemory\` — list what's saved specifically for this private chat`,
     `\`${PREFIX}forgetchannel <id>\` — remove one entry from this channel's memory`,
-    `\`${PREFIX}forgetchannelall\` — wipe this channel's entire memory (does not touch your global facts)`,
+    `\`${PREFIX}forgetchannelall\` — wipe this channel's memory + recent conversation history (does not touch your global facts)`,
     '',
     '**Shared server knowledge (Admin)**',
     `\`${PREFIX}know <topic> | <content>\` — save a piece of knowledge shared by the whole server`,
     `\`${PREFIX}knowledge\` — list knowledge saved for this server`,
     `\`${PREFIX}forgetknowledge <id>\` — remove a server knowledge entry`,
+    '',
+    '**Database tools**',
+    `\`${PREFIX}dbcheck\` — see raw row counts (facts/knowledge/channel memory) to diagnose "why isn't this working"`,
+    `\`${PREFIX}dbwipe me\` — (Admin) wipe YOUR data everywhere, database + local history`,
+    `\`${PREFIX}dbwipe guild\` — (Admin) ⚠️ wipe ALL data for this entire server: every user's facts, this server's knowledge base, all channel memory, and all cached conversation history. Cannot be undone`,
     '',
     '**Lookup**',
     `\`${PREFIX}search <keywords>\` — full-text search across your global facts, this channel's memory (if applicable), and server knowledge`,
@@ -1215,7 +1322,24 @@ async function handleSlashLikeCommand(message) {
         case 'forgetme': {
             if (!requireDb(message)) return;
             await dbClearUserFacts(message.author.id);
-            return message.reply('🧹 Erased everything I globally remember about you.');
+            const clearedHere = isPrivateAiChannelFor(message) ? clearLocalChannelHistory(message.channelId) : false;
+            return message.reply(
+                '🧹 Erased everything I globally remember about you (database).' +
+                (clearedHere
+                    ? ' Also cleared this channel\'s recent conversation memory so I stop echoing anything from it.'
+                    : ` Note: in a shared channel I may still reference the last few lines of our recent chat here until it scrolls out — that's normal short-term context, not saved memory. Use \`${PREFIX}forgetall\` inside your private AI channel for a full reset.`)
+            );
+        }
+        case 'forgetall': {
+            if (!requireDb(message)) return;
+            if (!isPrivateAiChannelFor(message)) return message.reply(`This command only works inside your own private AI chat channel (use \`${PREFIX}aichat\` to get one). It fully wipes both your global facts AND this channel's memory/history in one go.`);
+            const wipe = await dbWipeUserEverywhere(message.author.id);
+            clearLocalChannelHistory(message.channelId);
+            presence.delete(presenceKey(message.channelId, message.author.id));
+            if (!wipe.ok) {
+                return message.reply(`⚠️ Partially wiped — some database deletes failed: ${wipe.errors.join('; ')}. Local channel memory was cleared regardless.`);
+            }
+            return message.reply('🧹 Full reset done: erased your global facts, this channel\'s memory, and this channel\'s recent conversation history.');
         }
         case 'channelmemory': {
             if (!requireDb(message)) return;
@@ -1239,7 +1363,9 @@ async function handleSlashLikeCommand(message) {
             if (!requireDb(message)) return;
             if (!isPrivateAiChannelFor(message)) return message.reply('This command only works inside your own private AI chat channel.');
             await dbClearChannelMemory(message.channelId);
-            return message.reply("🧹 Wiped this channel's memory. Your global facts are untouched.");
+            clearLocalChannelHistory(message.channelId);
+            presence.delete(presenceKey(message.channelId, message.author.id));
+            return message.reply("🧹 Wiped this channel's memory and recent conversation history. Your global facts are untouched.");
         }
         case 'know': {
             if (!requireAdmin(message)) return;
@@ -1248,8 +1374,9 @@ async function handleSlashLikeCommand(message) {
             const [topic, ...contentParts] = rest.split('|');
             const content = contentParts.join('|').trim();
             if (!content) return message.reply(`Syntax: \`${PREFIX}know <topic> | <content>\` (missing a \`|\`).`);
-            await dbAddKnowledge(message.guildId, topic.trim(), content, message.author.id);
-            return message.reply(`✅ Saved knowledge "${topic.trim()}" for this server.`);
+            const savedKnowledge = await dbAddKnowledge(message.guildId, topic.trim(), content, message.author.id);
+            if (!savedKnowledge) return message.reply(`⚠️ Failed to save — check the bot logs, or run \`${PREFIX}dbcheck\` to see what's going on with the database.`);
+            return message.reply(`✅ Saved knowledge "${topic.trim()}" for this server. (guild_id: \`${message.guildId}\`)`);
         }
         case 'knowledge': {
             if (!requireDb(message)) return;
@@ -1283,6 +1410,49 @@ async function handleSlashLikeCommand(message) {
             if (facts.length) parts.push('**About you (global):**\n' + facts.map((f) => `- ${f.fact}`).join('\n'));
             if (knowledge.length) parts.push('**Server knowledge:**\n' + knowledge.map((k) => `- ${k.topic ? k.topic + ': ' : ''}${k.content}`).join('\n'));
             return message.reply(`🔎 Results for "${rest}":\n\n${parts.join('\n\n')}`);
+        }
+        case 'dbcheck': {
+            if (!requireDb(message)) return;
+            const diag = await dbDiagnostics(message.guildId, message.author.id, message.channelId);
+            const lines = [
+                `**user_facts** — total rows: ${diag.user_facts_total ?? `error: ${diag.user_facts_total_error}`}, yours: ${diag.user_facts_mine ?? `error: ${diag.user_facts_mine_error}`}`,
+                `**knowledge_base** — total rows: ${diag.knowledge_base_total ?? `error: ${diag.knowledge_base_total_error}`}, this guild (\`${diag.guild_id_used}\`): ${diag.knowledge_base_this_guild ?? `error: ${diag.knowledge_base_this_guild_error}`}`,
+                `**channel_memory** — total rows: ${diag.channel_memory_total ?? `error: ${diag.channel_memory_total_error}`}, this channel: ${diag.channel_memory_this_channel ?? `error: ${diag.channel_memory_this_channel_error}`}`,
+                `**local chat history** — this channel: ${getChannelHistory(message.channelId).length} messages cached`,
+            ];
+            let note = '';
+            if ((diag.knowledge_base_total || 0) > 0 && (diag.knowledge_base_this_guild || 0) === 0) {
+                note = '\n\n⚠️ There ARE knowledge_base rows in the database, but none match this server\'s guild_id — they were probably saved from a different server (or the `fts`/full-text migration hasn\'t been run, causing search errors). Check the `guild_id` column values in Supabase against this server\'s ID.';
+            } else if ((diag.knowledge_base_total || 0) === 0) {
+                note = `\n\nℹ️ knowledge_base has zero rows total — nothing has been saved yet. Use \`${PREFIX}know <topic> | <content>\` to add some.`;
+            }
+            return message.reply(`🔧 **DB diagnostics**\n${lines.join('\n')}${note}`);
+        }
+        case 'dbwipe': {
+            if (!requireAdmin(message)) return;
+            if (!requireDb(message)) return;
+            if (!rest || !['me', 'guild'].includes(rest.trim().toLowerCase())) {
+                return message.reply(`Syntax: \`${PREFIX}dbwipe me\` (wipe your own data everywhere) or \`${PREFIX}dbwipe guild\` (⚠️ wipes ALL facts/knowledge/channel memory for this whole server, Admin only, cannot be undone).`);
+            }
+            const mode = rest.trim().toLowerCase();
+            if (mode === 'me') {
+                const wipe = await dbWipeUserEverywhere(message.author.id);
+                if (isPrivateAiChannelFor(message)) clearLocalChannelHistory(message.channelId);
+                presence.delete(presenceKey(message.channelId, message.author.id));
+                return message.reply(wipe.ok ? '🧹 Wiped your data across the entire database.' : `⚠️ Partially wiped, errors: ${wipe.errors.join('; ')}`);
+            }
+            const wipe = await dbWipeGuildEverywhere(message.guildId);
+            const guildChannelIds = Object.keys(store.channels).filter((cid) => message.guild?.channels.cache.get(cid) !== undefined);
+            const n = clearLocalGuildHistory(guildChannelIds);
+            for (const cid of guildChannelIds) {
+                for (const key of [...presence.keys()]) if (key.startsWith(`${cid}:`)) presence.delete(key);
+            }
+            return message.reply(
+                (wipe.ok
+                    ? `🧹 Wiped ALL server data: every user's facts, this server's knowledge base, and all private-channel memory for this guild.`
+                    : `⚠️ Partially wiped, errors: ${wipe.errors.join('; ')}`) +
+                ` Also cleared local conversation history for ${n} tracked channel(s) — so I won't keep "remembering" anything from recent chat transcripts either.`
+            );
         }
         case 'aichat': {
             if (!message.guild) return message.reply("This command only works inside a server, not in DMs.");
