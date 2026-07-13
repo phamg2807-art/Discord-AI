@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, Partials, PermissionsBitField, ChannelType, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, PermissionsBitField, ChannelType, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } = require('discord.js');
 const { Mistral } = require('@mistralai/mistralai');
 const { createClient } = require('@supabase/supabase-js');
 const http = require('http');
@@ -55,39 +55,9 @@ const DISCORD_MAX_LEN = 2000;
 const CHUNK_SIZE = 1900; // leave headroom under Discord's 2000 char limit
 
 // ============================================================
-// 3b. presence awareness + emotional tone + voice bridge config
+// 3b. voice<->text bridge (shared via Supabase table `bot_bridge`)
 // ============================================================
-const IDLE_CHECKIN_MS = 6 * 60_000;       // 6 minutes of silence -> check in once
-const IDLE_SWEEP_INTERVAL_MS = 60_000;    // how often we scan for idle users
-const WELCOME_BACK_WINDOW_MS = 45 * 60_000; // if they were gone < this, it's a "welcome back", not a fresh start
-const MAX_CHECKINS_PER_THREAD = 1;        // don't keep pinging after the first unanswered check-in
 
-// Tracks live conversation "presence" per channel+user so we know who's
-// mid-conversation, when they last spoke, and whether we already nudged them.
-// Keyed by `${channelId}:${userId}`.
-const presence = new Map();
-
-function presenceKey(channelId, userId) {
-    return `${channelId}:${userId}`;
-}
-function touchPresence(channelId, userId) {
-    const key = presenceKey(channelId, userId);
-    const prev = presence.get(key);
-    const now = Date.now();
-    const wasAway = prev && (now - prev.lastActiveAt) >= IDLE_CHECKIN_MS;
-    const awayForMs = prev ? now - prev.lastActiveAt : null;
-    presence.set(key, { lastActiveAt: now, checkinsSent: 0, awaitingReturn: false });
-    return { wasAway, awayForMs, isFirstTimeSeen: !prev };
-}
-function markCheckinSent(channelId, userId) {
-    const key = presenceKey(channelId, userId);
-    const p = presence.get(key);
-    if (p) { p.checkinsSent += 1; p.awaitingReturn = true; }
-}
-
-// ============================================================
-// 3c. voice<->text bridge (shared via Supabase table `bot_bridge`)
-// ============================================================
 const BRIDGE_POLL_INTERVAL_MS = 8_000;
 let lastBridgePollAt = 0;
 
@@ -384,6 +354,70 @@ async function dbClearChannelMemory(channelId) {
 async function dbSearchChannelMemory(channelId, query, limit = RETRIEVAL_LIMIT) {
     if (!dbEnabled() || !query) return [];
     return ftsSearch('channel_memory', { channel_id: channelId }, query, limit);
+}
+
+// ---- channel_settings (per private-AI-channel configuration) ----------
+// Powers the pinned settings embed: privacy, auto-learn, tool use,
+// language lock, verbosity, persona override, and notification prefs.
+const DEFAULT_CHANNEL_SETTINGS = {
+    privacy_save_memory: true,
+    auto_learn: true,
+    allow_tools: true,
+    language_lock: null,
+    verbosity: 'normal', // 'concise' | 'normal' | 'detailed'
+    persona_override: null,
+    notify_on_mention: true,
+    notify_on_reply: true,
+};
+
+// Small in-memory cache so we're not round-tripping to Supabase on every
+// single message just to read toggle state — settings change rarely
+// (button clicks), so a short-lived cache is safe and fast.
+const channelSettingsCache = new Map(); // channelId -> { data, fetchedAt }
+const SETTINGS_CACHE_TTL_MS = 15_000;
+
+async function dbGetChannelSettings(channelId, userId, guildId) {
+    if (!dbEnabled()) return { ...DEFAULT_CHANNEL_SETTINGS, channel_id: channelId };
+    const cached = channelSettingsCache.get(channelId);
+    if (cached && Date.now() - cached.fetchedAt < SETTINGS_CACHE_TTL_MS) return cached.data;
+
+    const { data, error } = await supabase
+        .from('channel_settings').select('*').eq('channel_id', channelId).maybeSingle();
+    if (error) { console.error('dbGetChannelSettings:', error.message); return { ...DEFAULT_CHANNEL_SETTINGS, channel_id: channelId }; }
+    if (!data) {
+        // First time — create the row with defaults.
+        const { data: created, error: insertErr } = await supabase
+            .from('channel_settings')
+            .insert({ channel_id: channelId, user_id: userId, guild_id: guildId, ...DEFAULT_CHANNEL_SETTINGS })
+            .select()
+            .single();
+        if (insertErr) { console.error('dbGetChannelSettings (create):', insertErr.message); return { ...DEFAULT_CHANNEL_SETTINGS, channel_id: channelId }; }
+        channelSettingsCache.set(channelId, { data: created, fetchedAt: Date.now() });
+        return created;
+    }
+    channelSettingsCache.set(channelId, { data, fetchedAt: Date.now() });
+    return data;
+}
+
+async function dbUpdateChannelSettings(channelId, patch) {
+    if (!dbEnabled()) return null;
+    const { data, error } = await supabase
+        .from('channel_settings')
+        .update({ ...patch, updated_at: new Date().toISOString() })
+        .eq('channel_id', channelId)
+        .select()
+        .single();
+    if (error) { console.error('dbUpdateChannelSettings:', error.message); return null; }
+    channelSettingsCache.set(channelId, { data, fetchedAt: Date.now() });
+    return data;
+}
+
+async function dbSetSettingsMessageId(channelId, messageId) {
+    if (!dbEnabled()) return;
+    const { error } = await supabase.from('channel_settings').update({ settings_message_id: messageId }).eq('channel_id', channelId);
+    if (error) console.error('dbSetSettingsMessageId:', error.message);
+    const cached = channelSettingsCache.get(channelId);
+    if (cached) cached.data.settings_message_id = messageId;
 }
 
 // ---- Full wipe helpers ----------------------------------------------
@@ -1051,7 +1085,90 @@ async function createOrGetPrivateChatChannel(guild, member) {
             },
         ],
     });
+
+    // Post + pin the dynamic settings embed right away so it's the first
+    // thing waiting in a brand-new private AI channel.
+    if (dbEnabled()) {
+        await dbGetChannelSettings(channel.id, member.id, guild.id); // creates the settings row with defaults
+        await postOrRefreshSettingsEmbed(channel, member.id, guild.id);
+    }
+
     return { channel, created: true };
+}
+
+// ------------------------------------------------------------
+// Settings embed — dynamic + pinned. Renders current toggle state as an
+// embed with button rows underneath. Re-used both for initial post and
+// for in-place edits after a button click, so the message ID stays the
+// same (dynamic, not a spam of new messages).
+// ------------------------------------------------------------
+const VERBOSITY_CYCLE = ['concise', 'normal', 'detailed'];
+
+function onOff(bool) { return bool ? '✅ On' : '❌ Off'; }
+
+function buildSettingsEmbed(settings, member) {
+    return new EmbedBuilder()
+        .setTitle('⚙️ Private AI Channel Settings')
+        .setDescription(
+            `Personal configuration for ${member ? `<@${member.id}>` : 'this'}'s private AI chat channel. ` +
+            `Click the buttons below to change anything — this message updates in place and stays pinned.`
+        )
+        .setColor(0x5865f2)
+        .addFields(
+            { name: '🔒 Privacy — save channel memory', value: onOff(settings.privacy_save_memory), inline: true },
+            { name: '🧠 Auto-learn from chat', value: onOff(settings.auto_learn), inline: true },
+            { name: '🛠️ Allow AI tool use', value: onOff(settings.allow_tools), inline: true },
+            { name: '🌐 Language lock', value: settings.language_lock ? settings.language_lock.toUpperCase() : 'Auto-detect', inline: true },
+            { name: '📝 Response verbosity', value: settings.verbosity.charAt(0).toUpperCase() + settings.verbosity.slice(1), inline: true },
+            { name: '🎭 Persona override', value: settings.persona_override ? 'Custom (set)' : 'Server default', inline: true },
+            { name: '🔔 Notify on mention', value: onOff(settings.notify_on_mention), inline: true },
+            { name: '🔔 Notify on reply', value: onOff(settings.notify_on_reply), inline: true },
+        )
+        .setFooter({ text: `Channel ID: ${settings.channel_id}` })
+        .setTimestamp();
+}
+
+function buildSettingsButtonRows(settings) {
+    const row1 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('cs:toggle:privacy_save_memory').setLabel(settings.privacy_save_memory ? 'Privacy: On' : 'Privacy: Off').setStyle(settings.privacy_save_memory ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('cs:toggle:auto_learn').setLabel(settings.auto_learn ? 'Auto-learn: On' : 'Auto-learn: Off').setStyle(settings.auto_learn ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('cs:toggle:allow_tools').setLabel(settings.allow_tools ? 'Tools: On' : 'Tools: Off').setStyle(settings.allow_tools ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('cs:toggle:notify_on_mention').setLabel(settings.notify_on_mention ? 'Notify: On' : 'Notify: Off').setStyle(settings.notify_on_mention ? ButtonStyle.Success : ButtonStyle.Secondary),
+    );
+    const row2 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('cs:cycle:verbosity').setLabel(`Verbosity: ${settings.verbosity}`).setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('cs:cycle:language_lock').setLabel(`Language: ${settings.language_lock ? settings.language_lock.toUpperCase() : 'Auto'}`).setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('cs:persona:edit').setLabel('Edit persona override').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('cs:persona:clear').setLabel('Clear persona override').setStyle(ButtonStyle.Danger),
+    );
+    const row3 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('cs:refresh').setLabel('🔄 Refresh').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('cs:reset').setLabel('↩️ Reset to defaults').setStyle(ButtonStyle.Danger),
+    );
+    return [row1, row2, row3];
+}
+
+async function postOrRefreshSettingsEmbed(channel, userId, guildId) {
+    if (!dbEnabled()) return null;
+    const settings = await dbGetChannelSettings(channel.id, userId, guildId);
+    const embed = buildSettingsEmbed(settings, { id: userId });
+    const components = buildSettingsButtonRows(settings);
+
+    if (settings.settings_message_id) {
+        try {
+            const existingMsg = await channel.messages.fetch(settings.settings_message_id);
+            await existingMsg.edit({ embeds: [embed], components });
+            return existingMsg;
+        } catch (e) {
+            // Message was deleted/unpinned externally — fall through and repost.
+            console.error('postOrRefreshSettingsEmbed: could not fetch/edit existing message, reposting:', e.message);
+        }
+    }
+
+    const sent = await channel.send({ embeds: [embed], components });
+    try { await sent.pin(); } catch (e) { console.error('Could not pin settings embed:', e.message); }
+    await dbSetSettingsMessageId(channel.id, sent.id);
+    return sent;
 }
 
 // ============================================================
@@ -1281,7 +1398,7 @@ async function handleSlashLikeCommand(message) {
                 `- Servers served: ${client.guilds.cache.size}\n` +
                 `- Uptime: ${h}h ${m}m\n` +
                 `- Knowledge database: ${dbEnabled() ? '✅ Connected' : '❌ Not configured'}\n` +
-                `- Active conversation threads tracked: ${presence.size}`
+                `- Tracked chat-history channels: ${Object.keys(store.channels).length}`
             );
         }
         case 'persona': {
@@ -1335,7 +1452,6 @@ async function handleSlashLikeCommand(message) {
             if (!isPrivateAiChannelFor(message)) return message.reply(`This command only works inside your own private AI chat channel (use \`${PREFIX}aichat\` to get one). It fully wipes both your global facts AND this channel's memory/history in one go.`);
             const wipe = await dbWipeUserEverywhere(message.author.id);
             clearLocalChannelHistory(message.channelId);
-            presence.delete(presenceKey(message.channelId, message.author.id));
             if (!wipe.ok) {
                 return message.reply(`⚠️ Partially wiped — some database deletes failed: ${wipe.errors.join('; ')}. Local channel memory was cleared regardless.`);
             }
@@ -1364,7 +1480,6 @@ async function handleSlashLikeCommand(message) {
             if (!isPrivateAiChannelFor(message)) return message.reply('This command only works inside your own private AI chat channel.');
             await dbClearChannelMemory(message.channelId);
             clearLocalChannelHistory(message.channelId);
-            presence.delete(presenceKey(message.channelId, message.author.id));
             return message.reply("🧹 Wiped this channel's memory and recent conversation history. Your global facts are untouched.");
         }
         case 'know': {
@@ -1438,15 +1553,11 @@ async function handleSlashLikeCommand(message) {
             if (mode === 'me') {
                 const wipe = await dbWipeUserEverywhere(message.author.id);
                 if (isPrivateAiChannelFor(message)) clearLocalChannelHistory(message.channelId);
-                presence.delete(presenceKey(message.channelId, message.author.id));
                 return message.reply(wipe.ok ? '🧹 Wiped your data across the entire database.' : `⚠️ Partially wiped, errors: ${wipe.errors.join('; ')}`);
             }
             const wipe = await dbWipeGuildEverywhere(message.guildId);
             const guildChannelIds = Object.keys(store.channels).filter((cid) => message.guild?.channels.cache.get(cid) !== undefined);
             const n = clearLocalGuildHistory(guildChannelIds);
-            for (const cid of guildChannelIds) {
-                for (const key of [...presence.keys()]) if (key.startsWith(`${cid}:`)) presence.delete(key);
-            }
             return message.reply(
                 (wipe.ok
                     ? `🧹 Wiped ALL server data: every user's facts, this server's knowledge base, and all private-channel memory for this guild.`
@@ -1513,57 +1624,9 @@ async function sendLongReply(message, text) {
 }
 
 // ============================================================
-// 12. presence sweep: idle check-ins + welcome-backs
+// 12. Voice bridge polling (idle-checkin/presence-sweep system removed —
+//    the bot no longer proactively messages users who go quiet)
 // ============================================================
-async function presenceSweep() {
-    const now = Date.now();
-    for (const [key, p] of presence.entries()) {
-        if (p.awaitingReturn) continue;
-        if (p.checkinsSent >= MAX_CHECKINS_PER_THREAD) continue;
-        if (now - p.lastActiveAt < IDLE_CHECKIN_MS) continue;
-
-        const [channelId, userId] = key.split(':');
-        try {
-            const channel = await client.channels.fetch(channelId).catch(() => null);
-            if (!channel || !channel.isTextBased()) { presence.delete(key); continue; }
-
-            const history = getChannelHistory(channelId);
-            if (!history.length) { presence.delete(key); continue; }
-
-            const guildId = channel.guildId;
-            const persona = guildId ? getGuild(guildId).persona : DEFAULT_PERSONA;
-            const contextTail = history.slice(-4).map((m) => `${m.role === 'user' ? 'User' : 'Bot'}: ${m.content}`).join('\n');
-
-            const sys =
-                persona +
-                '\n\nThe user went quiet mid-conversation a little while ago and hasn\'t replied since. Write a ' +
-                'SHORT, warm, natural check-in message (one sentence, maybe two) — like a friend noticing someone ' +
-                'trailed off, curious or a little concerned depending on what you were talking about. Don\'t be ' +
-                'clingy or dramatic, and don\'t apologize for checking in. Reference what you were just discussing ' +
-                'if it makes sense to.';
-
-            let checkinText;
-            try {
-                const result = await getGeneralChatReply([
-                    { role: 'system', content: sys },
-                    { role: 'user', content: `Recent conversation:\n${contextTail}\n\n(Write the check-in message now.)` },
-                ]);
-                checkinText = result.text;
-            } catch (e) {
-                console.error('Presence check-in generation failed, using fallback line:', e.message);
-                checkinText = "Hey, you still there? 👀";
-            }
-
-            await channel.send(checkinText || "Hey, you still around?");
-            pushHistory(channelId, { role: 'assistant', content: checkinText || 'Hey, you still around?' });
-            markCheckinSent(channelId, userId);
-            console.log(`👋 Sent idle check-in in channel ${channelId} for user ${userId}`);
-        } catch (e) {
-            console.error('presenceSweep failed for a thread (non-fatal):', e.message);
-        }
-    }
-}
-setInterval(() => { presenceSweep().catch((e) => console.error('presenceSweep crashed:', e.message)); }, IDLE_SWEEP_INTERVAL_MS);
 setInterval(() => { pollBridgeForVoiceRequests().catch((e) => console.error('bridge poll crashed:', e.message)); }, BRIDGE_POLL_INTERVAL_MS);
 
 // ============================================================
@@ -1618,21 +1681,11 @@ client.on('messageCreate', async (message) => {
         const isCode = looksLikeCode(cleanPrompt);
         const history = getChannelHistory(channelId);
 
-        const { wasAway, awayForMs } = touchPresence(channelId, message.author.id);
+        // NOTE: idle-checkin / "welcome back" presence tracking was removed —
+        // the bot no longer proactively comments on gaps in conversation or
+        // sends unsolicited "you still there?" messages. presenceNote is now
+        // used ONLY for the voice-bridge acknowledgment note below.
         let presenceNote = null;
-        if (wasAway) {
-            const minutes = Math.round(awayForMs / 60000);
-            if (awayForMs <= WELCOME_BACK_WINDOW_MS) {
-                presenceNote =
-                    `PRESENCE NOTE: This user went quiet for about ${minutes} minute(s) mid-conversation and has ` +
-                    `just come back. Naturally acknowledge that they're back (briefly, warmly, no big deal) before ` +
-                    `or while answering their message — don't ignore the gap, but don't make it awkward either.`;
-            } else {
-                presenceNote =
-                    `PRESENCE NOTE: This user has been gone a while (roughly ${minutes} minutes) and is now back. ` +
-                    `Give a genuine, warm little "welcome back" moment before getting into their message.`;
-            }
-        }
 
         let bridgeNote = null;
         if (dbEnabled() && message.guildId) {
