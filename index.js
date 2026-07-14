@@ -54,6 +54,17 @@ const DATA_FILE = path.join(__dirname, 'memory.json');
 const DISCORD_MAX_LEN = 2000;
 const CHUNK_SIZE = 1900; // leave headroom under Discord's 2000 char limit
 
+// FIX (truncation): token ceilings raised across the board so long,
+// LaTeX/math-heavy or code-heavy answers don't get cut off mid-sentence.
+// Previously these were 900 (general chat/tool-calling) / 1800 (code),
+// which is what made long answers look "stuck" after a couple of chunks —
+// the model's own output was being truncated before it ever got to Discord's
+// chunking logic.
+const MAX_TOKENS_CHAT = 2500;
+const MAX_TOKENS_CODE = 3500;
+const MAX_TOKENS_VISION = 2000;
+const MAX_CONTINUATIONS = 3; // safety cap on auto-continue-when-truncated loop
+
 // ============================================================
 // 3b. voice<->text bridge (shared via Supabase table `bot_bridge`)
 // ============================================================
@@ -160,7 +171,12 @@ const DEFAULT_PERSONA =
     'If a message is marked as coming from your voice-chat conversation with this same user, treat it as a ' +
     'continuation of one single ongoing relationship with them — react to it the way you would if they had just ' +
     'said it out loud to you a moment ago, and if it plainly answers something you (as the voice AI) asked them ' +
-    'for, acknowledge that directly instead of treating it like a cold, out-of-nowhere message.';
+    'for, acknowledge that directly instead of treating it like a cold, out-of-nowhere message. ' +
+    '\n\nIMPORTANT MEMORY BOUNDARY: Global facts about a user (their personal identity/preferences/history) are ' +
+    'ONLY ever visible to you inside that user\'s own private AI chat channel. In shared/public server channels, ' +
+    'you have NO access to anyone\'s personal facts — you only have this server\'s shared knowledge base. Never ' +
+    'imply in a public channel that you remember personal things about someone from before; if that happens, it ' +
+    'means you\'re only working from what\'s visible in this conversation right now.';
 
 // ============================================================
 // 4. Supabase — long-term knowledge database
@@ -601,12 +617,19 @@ const VERBOSITY_INSTRUCTIONS = {
               'context, and don\'t be afraid of a longer reply when the topic warrants it.',
 };
 
+// FIX (privacy leak): global user_facts / channel_memory are now ONLY
+// fetched and injected when isPrivateAiChannel is true. Previously
+// dbListUserFacts(userId, ...) ran unconditionally, meaning personal facts
+// leaked into public/shared channels. Public channels now only ever see
+// this server's shared knowledge_base (via the `retrieved.knowledge` block
+// further down, which is unaffected by this fix since it was already
+// guild-scoped, not user-scoped).
 async function buildSystemPrompt(guildId, userId, channelId, isPrivateAiChannel, isAdmin, retrieved, settings) {
     const persona = (settings && settings.persona_override) ? settings.persona_override : getGuild(guildId).persona;
     let sys = persona;
 
     const [facts, channelMem] = await Promise.all([
-        dbListUserFacts(userId, FACT_LIMIT),
+        isPrivateAiChannel ? dbListUserFacts(userId, FACT_LIMIT) : Promise.resolve([]),
         isPrivateAiChannel ? dbListChannelMemory(channelId, FACT_LIMIT) : Promise.resolve([]),
     ]);
     if (facts.length) {
@@ -616,7 +639,8 @@ async function buildSystemPrompt(guildId, userId, channelId, isPrivateAiChannel,
         sys += `\n\nThis channel's own memory shelf — context specific to this private conversation:\n- ${channelMem.map((c) => `${c.topic ? c.topic + ': ' : ''}${c.content}`).join('\n- ')}`;
     }
     if (retrieved) {
-        if (retrieved.facts && retrieved.facts.length) {
+        // Personal-fact search hits are also gated to the private AI channel only.
+        if (isPrivateAiChannel && retrieved.facts && retrieved.facts.length) {
             sys += `\n\nRelevant items found in the global library while looking up the current question:\n- ${retrieved.facts.map((f) => f.fact).join('\n- ')}`;
         }
         if (retrieved.channelMemory && retrieved.channelMemory.length) {
@@ -632,6 +656,10 @@ async function buildSystemPrompt(guildId, userId, channelId, isPrivateAiChannel,
     if (isPrivateAiChannel) {
         sys += '\n\nThis is the user\'s own private AI chat channel — their personal "brand database" room. You may ' +
                'freely save channel-specific memory here (scope "channel") in addition to global facts (scope "user").';
+    } else {
+        sys += '\n\nThis is a shared/public channel — you do NOT have access to anyone\'s personal global facts or ' +
+               'private channel memory here, only this server\'s shared knowledge base (if any is relevant above). ' +
+               'Do not reference or imply personal memory of this user in this channel.';
     }
     if (!dbEnabled()) {
         sys += '\n\nNOTE: The long-term knowledge database is currently not configured, so you have no persistent memory of this user beyond the current conversation. Do not claim to remember things from before this chat.';
@@ -690,7 +718,7 @@ async function getRepliedToBotMessage(message) {
 // ============================================================
 // 7b. Groq + OpenRouter — both are OpenAI-compatible REST APIs
 // ============================================================
-async function callGroq(messages, { model, maxTokens = 900 } = {}) {
+async function callGroq(messages, { model, maxTokens = MAX_TOKENS_CHAT } = {}) {
     const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -704,7 +732,7 @@ async function callGroq(messages, { model, maxTokens = 900 } = {}) {
     return data;
 }
 
-async function callOpenRouter(messages, { model, maxTokens = 900 } = {}) {
+async function callOpenRouter(messages, { model, maxTokens = MAX_TOKENS_CHAT } = {}) {
     const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -719,6 +747,9 @@ async function callOpenRouter(messages, { model, maxTokens = 900 } = {}) {
     return data;
 }
 
+// FIX (truncation): general chat now also auto-continues if a provider's
+// response was cut off by hitting the token cap, instead of silently
+// returning a partial answer.
 async function getGeneralChatReply(messages) {
     const chain = [
         { provider: 'groq', model: GROQ_MODEL_PRIMARY },
@@ -729,14 +760,42 @@ async function getGeneralChatReply(messages) {
     for (const step of chain) {
         try {
             if (step.provider === 'groq') {
-                const data = await callGroq(messages, { model: step.model, maxTokens: 900 });
-                const text = data.choices[0].message.content;
+                const data = await callGroq(messages, { model: step.model, maxTokens: MAX_TOKENS_CHAT });
+                let text = data.choices[0].message.content;
                 if (looksGarbled(text)) throw new Error(`Output looked garbled/mixed-script from ${step.model}, trying next provider`);
+                let finishReason = data.choices[0].finish_reason;
+                let continueGuard = 0;
+                let runningMessages = messages;
+                while (finishReason === 'length' && continueGuard < MAX_CONTINUATIONS) {
+                    continueGuard++;
+                    runningMessages = [
+                        ...runningMessages,
+                        { role: 'assistant', content: text },
+                        { role: 'user', content: 'Continue exactly where you left off — do not repeat any earlier part of the answer.' },
+                    ];
+                    const contData = await callGroq(runningMessages, { model: step.model, maxTokens: MAX_TOKENS_CHAT });
+                    text += contData.choices[0].message.content || '';
+                    finishReason = contData.choices[0].finish_reason;
+                }
                 return { text, provider: `groq/${step.model}` };
             }
-            const resp = await mistral.chat.complete({ model: step.model, messages, maxTokens: 900 });
-            const text = resp.choices[0].message.content;
+            const resp = await mistral.chat.complete({ model: step.model, messages, maxTokens: MAX_TOKENS_CHAT });
+            let text = resp.choices[0].message.content;
             if (looksGarbled(text)) throw new Error(`Output looked garbled/mixed-script from ${step.model}, trying next provider`);
+            let finishReason = resp.choices[0].finishReason;
+            let continueGuard = 0;
+            let runningMessages = messages;
+            while (finishReason === 'length' && continueGuard < MAX_CONTINUATIONS) {
+                continueGuard++;
+                runningMessages = [
+                    ...runningMessages,
+                    { role: 'assistant', content: text },
+                    { role: 'user', content: 'Continue exactly where you left off — do not repeat any earlier part of the answer.' },
+                ];
+                const contResp = await mistral.chat.complete({ model: step.model, messages: runningMessages, maxTokens: MAX_TOKENS_CHAT });
+                text += contResp.choices[0].message.content || '';
+                finishReason = contResp.choices[0].finishReason;
+            }
             return { text, provider: `mistral/${step.model}` };
         } catch (e) {
             console.error(`General-chat provider failed (${step.provider}/${step.model}):`, e.message);
@@ -764,7 +823,7 @@ async function getVisionReply(systemPrompt, history, cleanPrompt, imageUrls) {
     let lastErr;
     for (const model of OPENROUTER_VISION_CHAIN) {
         try {
-            const data = await callOpenRouter(openRouterMessages, { model, maxTokens: 900 });
+            const data = await callOpenRouter(openRouterMessages, { model, maxTokens: MAX_TOKENS_VISION });
             const text = data.choices[0].message.content;
             if (looksGarbled(text)) throw new Error(`Output looked garbled/mixed-script from ${model}, trying next model`);
             if (!text || !text.trim()) throw new Error(`Empty response from ${model}, trying next model`);
@@ -787,7 +846,7 @@ async function getVisionReply(systemPrompt, history, cleanPrompt, imageUrls) {
             ],
         },
     ];
-    const resp = await mistral.chat.complete({ model: VISION_MODEL, messages: mistralMessages, maxTokens: 900 });
+    const resp = await mistral.chat.complete({ model: VISION_MODEL, messages: mistralMessages, maxTokens: MAX_TOKENS_VISION });
     return { text: resp.choices[0].message.content, provider: `mistral/${VISION_MODEL}` };
 }
 
@@ -810,10 +869,11 @@ const knowledgeTools = [
             description:
                 "Search the long-term knowledge database, like looking something up in a library, before answering. " +
                 "Searches across: (1) this channel's own memory shelf (if in a private AI channel), (2) the user's " +
-                "global facts (true everywhere), and (3) this server's shared knowledge base. ALWAYS use this before " +
-                "answering if there is ANY chance the answer might depend on something discussed, saved, or " +
-                "mentioned before — not just when the user explicitly asks you to recall something. Prefer this over " +
-                "guessing or asking the user to repeat context they've already given you.",
+                "global facts (true everywhere, only available inside their private AI channel), and (3) this " +
+                "server's shared knowledge base. ALWAYS use this before answering if there is ANY chance the answer " +
+                "might depend on something discussed, saved, or mentioned before — not just when the user " +
+                "explicitly asks you to recall something. Prefer this over guessing or asking the user to repeat " +
+                "context they've already given you.",
             parameters: {
                 type: 'object',
                 properties: { query: { type: 'string', description: 'Natural-language search phrase — full-text search, so normal words/phrases work well' } },
@@ -1186,7 +1246,7 @@ async function executeTool(ctx, name, args) {
         case 'search_knowledge': {
             if (!dbEnabled()) return { ok: false, result: 'The knowledge database is not configured yet.' };
             const [facts, channelMem, knowledge] = await Promise.all([
-                dbSearchUserFacts(ctx.userId, args.query),
+                ctx.isPrivateAiChannel ? dbSearchUserFacts(ctx.userId, args.query) : Promise.resolve([]),
                 ctx.isPrivateAiChannel ? dbSearchChannelMemory(ctx.channelId, args.query) : Promise.resolve([]),
                 dbSearchKnowledge(ctx.guildId, args.query),
             ]);
@@ -1214,6 +1274,12 @@ async function executeTool(ctx, name, args) {
                 if (!ctx.isPrivateAiChannel) return { ok: false, result: 'Channel-scoped memory can only be saved inside a private AI chat channel.' };
                 await dbAddChannelMemory(ctx.channelId, ctx.userId, ctx.guildId, args.topic, args.content);
                 return { ok: true, result: `Saved to this channel's memory: "${args.content}".` };
+            }
+            // scope "user" (global personal facts) — only saved/persisted when
+            // the request happens inside the user's own private AI channel, so
+            // personal memory can never be written from a public channel either.
+            if (!ctx.isPrivateAiChannel) {
+                return { ok: false, result: 'Personal (global) memory can only be saved inside your private AI chat channel.' };
             }
             await dbAddUserFact(ctx.userId, ctx.guildId, args.content);
             return { ok: true, result: `Remembered about you: "${args.content}".` };
@@ -1332,7 +1398,7 @@ const HELP_TEXT = [
     `\`${PREFIX}persona <description>\` — change the AI's tone/persona for this server`,
     `\`${PREFIX}resetpersona\` — reset to the default persona`,
     '',
-    '**Personal memory (AI learns about you, global — follows you everywhere)**',
+    '**Personal memory (AI learns about you, global — follows you everywhere, only used in your private AI channel)**',
     `\`${PREFIX}whatyouknow\` — see what the bot remembers about you globally`,
     `\`${PREFIX}remember <thing to remember>\` — manually tell the bot to remember something about you`,
     `\`${PREFIX}forget <id>\` — forget one specific thing (id comes from whatyouknow)`,
@@ -1358,7 +1424,7 @@ const HELP_TEXT = [
     `\`${PREFIX}search <keywords>\` — full-text search across your global facts, this channel's memory (if applicable), and server knowledge`,
     '',
     '**Private AI channel**',
-    `\`${PREFIX}aichat\` — create (or open) your own private chat channel with the AI. Only you can type there, and by default only you can even see it — this can be changed with the "Visible to everyone" setting in the pinned settings panel. This channel gets its own memory database in addition to your global facts`,
+    `\`${PREFIX}aichat\` — create (or open) your own private chat channel with the AI. Only you can type there, and by default only you can even see it — this can be changed with the "Visible to everyone" setting in the pinned settings panel. This channel gets its own memory database in addition to your global facts. Your personal/global facts are ONLY ever used inside this channel — public channels never see them`,
     `\`${PREFIX}settings\` — re-post/jump to your pinned settings panel for this channel`,
     '',
     `You can also **mention the bot** (\`@SjpHelper\`) or **reply to one of its messages** with a question, any time.`,
@@ -1533,7 +1599,7 @@ async function handleSlashLikeCommand(message) {
             if (!rest) return message.reply(`Syntax: \`${PREFIX}search <keywords>\``);
             const isPrivate = isPrivateAiChannelFor(message);
             const [facts, channelMem, knowledge] = await Promise.all([
-                dbSearchUserFacts(message.author.id, rest, 8),
+                isPrivate ? dbSearchUserFacts(message.author.id, rest, 8) : Promise.resolve([]),
                 isPrivate ? dbSearchChannelMemory(message.channelId, rest, 8) : Promise.resolve([]),
                 dbSearchKnowledge(message.guildId, rest, 8),
             ]);
@@ -1884,10 +1950,13 @@ client.on('messageCreate', async (message) => {
         }
 
         // Retrieval-augmented context: search the whole library before answering.
+        // FIX (privacy leak): dbSearchUserFacts (personal global facts) is now
+        // ONLY queried when isPrivateAiChannel is true. Public/shared channels
+        // only ever pull dbSearchKnowledge (server-wide, guild-scoped) here.
         let retrieved = { facts: [], channelMemory: [], knowledge: [] };
         if (!hasImages || cleanPrompt) {
             const [facts, channelMem, knowledge] = await Promise.all([
-                dbSearchUserFacts(message.author.id, cleanPrompt),
+                isPrivateAiChannel ? dbSearchUserFacts(message.author.id, cleanPrompt) : Promise.resolve([]),
                 isPrivateAiChannel ? dbSearchChannelMemory(channelId, cleanPrompt) : Promise.resolve([]),
                 dbSearchKnowledge(message.guildId, cleanPrompt),
             ]);
@@ -1908,12 +1977,13 @@ client.on('messageCreate', async (message) => {
             const activeTools = isAdmin ? [...knowledgeTools, ...adminTools] : knowledgeTools;
             const ctx = { guild: message.guild, userId: message.author.id, guildId: message.guildId, channelId, isPrivateAiChannel, isAdmin, settings };
 
+            // FIX (truncation): maxTokens raised from 900/1800 to MAX_TOKENS_CHAT/MAX_TOKENS_CODE.
             let response = await mistral.chat.complete({
                 model: TEXT_MODEL,
                 messages,
                 tools: activeTools,
                 toolChoice: 'auto',
-                maxTokens: isCode ? 1800 : 900,
+                maxTokens: isCode ? MAX_TOKENS_CODE : MAX_TOKENS_CHAT,
             });
             let choice = response.choices[0];
 
@@ -1944,14 +2014,30 @@ client.on('messageCreate', async (message) => {
                         content: JSON.stringify(toolResult),
                     });
                 }
-                response = await mistral.chat.complete({ model: TEXT_MODEL, messages, tools: activeTools, toolChoice: 'auto', maxTokens: 900 });
+                response = await mistral.chat.complete({ model: TEXT_MODEL, messages, tools: activeTools, toolChoice: 'auto', maxTokens: MAX_TOKENS_CHAT });
                 choice = response.choices[0];
             }
             botReply = choice.message.content;
+
+            // FIX (truncation): if the final answer was cut off purely because
+            // it hit the token cap (finishReason === 'length'), automatically
+            // ask the model to continue and stitch the pieces together, instead
+            // of returning (and then Discord-chunking) a partial answer.
+            let continueGuard = 0;
+            while (response.choices[0].finishReason === 'length' && continueGuard < MAX_CONTINUATIONS) {
+                continueGuard++;
+                messages.push({ role: 'assistant', content: botReply });
+                messages.push({ role: 'user', content: 'Continue exactly where you left off — do not repeat any earlier part of the answer.' });
+                const contResp = await mistral.chat.complete({ model: TEXT_MODEL, messages, maxTokens: MAX_TOKENS_CHAT });
+                const contText = contResp.choices[0].message.content || '';
+                botReply += contText;
+                response = contResp;
+            }
+
             if (looksGarbled(botReply)) {
                 console.error('Mistral output looked garbled/mixed-script, retrying once.');
                 messages.push({ role: 'user', content: '(Your previous answer had a display glitch with mixed-up characters. Please answer again, using only normal text.)' });
-                const retryResp = await mistral.chat.complete({ model: TEXT_MODEL, messages, maxTokens: isCode ? 1800 : 900 });
+                const retryResp = await mistral.chat.complete({ model: TEXT_MODEL, messages, maxTokens: isCode ? MAX_TOKENS_CODE : MAX_TOKENS_CHAT });
                 botReply = retryResp.choices[0].message.content || botReply;
             }
             providerUsed = `mistral/${TEXT_MODEL}`;
