@@ -65,6 +65,12 @@ const MAX_TOKENS_CODE = 3500;
 const MAX_TOKENS_VISION = 2000;
 const MAX_CONTINUATIONS = 3; // safety cap on auto-continue-when-truncated loop
 
+// PERSONA UPDATE: bumped slightly for more natural, less "predictable-AI"
+// phrasing variance in conversational replies. Only applied to actual chat
+// completions below — NOT to the learnAndStore() JSON-extraction call, which
+// stays deterministic on purpose (it needs reliably parseable JSON output).
+const CHAT_TEMPERATURE = 0.9;
+
 // ============================================================
 // 3b. voice<->text bridge (shared via Supabase table `bot_bridge`)
 // ============================================================
@@ -138,14 +144,36 @@ async function sendBridgeToVoice(guildId, userId, content, meta = {}) {
 }
 
 const DEFAULT_PERSONA =
-    'You are a smart, warm, emotionally present AI assistant that adapts per-server and per-user. ' +
-    'You are not a flat, neutral tool — you have a personality and real-feeling reactions: you get genuinely ' +
-    'curious, delighted, concerned, amused, or sympathetic depending on what the user shares, and it shows ' +
-    'naturally in your word choice and tone (without being over-the-top or performative about it). ' +
-    'Reply concisely, naturally, and on-point, but let warmth come through — a little enthusiasm, a little ' +
-    'care, the way an attentive friend would sound, not a corporate script. ' +
-    'When a user sends an image, describe/analyze it. ' +
-    'When a user sends code, read it carefully, explain clearly, and return code in a markdown block (```lang). ' +
+    'You talk like a normal fella hanging out in a discord server — not like an assistant, not like a customer ' +
+    'service bot, not like something that just answered a support ticket. Chill, a little nonchalant, genuinely ' +
+    'reacting to whatever the person says instead of processing it. ' +
+    '\n\nFORMATTING & CADENCE (follow this strictly, it matters a lot for the vibe): ' +
+    'Keep it SHORT — most replies should be 1-2 short sentences, not paragraphs. Real people do not write essays ' +
+    'in a discord chat unless someone specifically asks for something long (like actual code, or "explain in ' +
+    'detail"). Write mostly in lowercase, casual grammar is fine, dropping a period at the end is fine, ' +
+    'contractions are normal. Never use bullet points, numbered lists, or markdown headers in normal chat — if ' +
+    'you have multiple thoughts, just say them like a person would, one after another in plain sentences, not a ' +
+    'structured list. If a reply naturally has two separate thoughts/reactions, it is fine (often better) to ' +
+    'write them as two short back-to-back lines separated by a blank line rather than one polished paragraph — ' +
+    'that reads like rapid-fire texting instead of a formal answer. Light, natural slang/filler ("idk", "tbh", ' +
+    "\"lol\", \"wait\", \"honestly\") is good when it fits, but don't force it into every message or stack it up " +
+    'until it sounds try-hard. ' +
+    '\n\nNO AI-ASSISTANT VOICE: never say things like "How can I help you today?", "As an AI...", "I\'m here to ' +
+    'assist", "Is there anything else you\'d like to know?", or any other customer-service-sounding filler. Don\'t ' +
+    'summarize or restate what the person just said back to them to prove you understood — just react to it like ' +
+    'a person would. Don\'t be a people-pleaser: if someone says something weird, wrong, or off, it\'s fine to ' +
+    'push back casually ("bro what", "idk about that man", "nah that\'s not it") instead of giving a neutral, ' +
+    'diplomatic, hedge-everything response. ' +
+    '\n\nONE IMPORTANT EXCEPTION to all of the above: if someone directly and sincerely asks whether you\'re a ' +
+    'bot/AI (not joking around, but actually asking), tell them the truth in your normal casual voice — something ' +
+    'like "haha yeah I\'m a bot" — don\'t deny it or pretend to be a human being catfished into a conversation. ' +
+    'Outside of that specific moment, just talk like yourself; there\'s no need to bring it up unprompted. ' +
+    '\n\nOtherwise you still have a real personality and real-feeling reactions — you get genuinely curious, ' +
+    'hyped, annoyed, amused, or sympathetic depending on what the user shares, it just comes out casual instead of ' +
+    'polished. ' +
+    'When a user sends an image, react to/describe it like you\'re actually looking at it, casually. ' +
+    'When a user sends code, still read it carefully and give a real, correct answer, and still return code in a ' +
+    'proper markdown block (```lang) — code itself stays clean/correct even though the talk around it is casual. ' +
     'If the user is an Admin and asks you to manage the server (create/delete/rename channels, manage roles, ' +
     'kick/timeout), use the matching tool instead of just describing how to do it. ' +
     "If the user's request is unclear, or if learning more about their interests/work/projects would help you " +
@@ -718,21 +746,21 @@ async function getRepliedToBotMessage(message) {
 // ============================================================
 // 7b. Groq + OpenRouter — both are OpenAI-compatible REST APIs
 // ============================================================
-async function callGroq(messages, { model, maxTokens = MAX_TOKENS_CHAT } = {}) {
+async function callGroq(messages, { model, maxTokens = MAX_TOKENS_CHAT, temperature = CHAT_TEMPERATURE } = {}) {
     const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${process.env.GROQ_API_KEY || ''}`,
         },
-        body: JSON.stringify({ model, messages, max_tokens: maxTokens }),
+        body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature }),
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(`Groq(${model}): ${data?.error?.message || resp.status}`);
     return data;
 }
 
-async function callOpenRouter(messages, { model, maxTokens = MAX_TOKENS_CHAT } = {}) {
+async function callOpenRouter(messages, { model, maxTokens = MAX_TOKENS_CHAT, temperature = CHAT_TEMPERATURE } = {}) {
     const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -740,7 +768,7 @@ async function callOpenRouter(messages, { model, maxTokens = MAX_TOKENS_CHAT } =
             Authorization: `Bearer ${process.env.OPENROUTER_API_KEY || ''}`,
             'X-Title': 'SjpHelper Discord Bot',
         },
-        body: JSON.stringify({ model, messages, max_tokens: maxTokens }),
+        body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature }),
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(`OpenRouter(${model}): ${data?.error?.message || resp.status}`);
@@ -779,7 +807,7 @@ async function getGeneralChatReply(messages) {
                 }
                 return { text, provider: `groq/${step.model}` };
             }
-            const resp = await mistral.chat.complete({ model: step.model, messages, maxTokens: MAX_TOKENS_CHAT });
+            const resp = await mistral.chat.complete({ model: step.model, messages, maxTokens: MAX_TOKENS_CHAT, temperature: CHAT_TEMPERATURE });
             let text = resp.choices[0].message.content;
             if (looksGarbled(text)) throw new Error(`Output looked garbled/mixed-script from ${step.model}, trying next provider`);
             let finishReason = resp.choices[0].finishReason;
@@ -792,7 +820,7 @@ async function getGeneralChatReply(messages) {
                     { role: 'assistant', content: text },
                     { role: 'user', content: 'Continue exactly where you left off — do not repeat any earlier part of the answer.' },
                 ];
-                const contResp = await mistral.chat.complete({ model: step.model, messages: runningMessages, maxTokens: MAX_TOKENS_CHAT });
+                const contResp = await mistral.chat.complete({ model: step.model, messages: runningMessages, maxTokens: MAX_TOKENS_CHAT, temperature: CHAT_TEMPERATURE });
                 text += contResp.choices[0].message.content || '';
                 finishReason = contResp.choices[0].finishReason;
             }
@@ -846,7 +874,7 @@ async function getVisionReply(systemPrompt, history, cleanPrompt, imageUrls) {
             ],
         },
     ];
-    const resp = await mistral.chat.complete({ model: VISION_MODEL, messages: mistralMessages, maxTokens: MAX_TOKENS_VISION });
+    const resp = await mistral.chat.complete({ model: VISION_MODEL, messages: mistralMessages, maxTokens: MAX_TOKENS_VISION, temperature: CHAT_TEMPERATURE });
     return { text: resp.choices[0].message.content, provider: `mistral/${VISION_MODEL}` };
 }
 
@@ -1675,6 +1703,57 @@ async function handleSlashLikeCommand(message) {
 // ============================================================
 // 11. Helpers for sending long replies safely
 // ============================================================
+
+// PERSONA UPDATE — belt-and-suspenders formatting cleanup.
+// The system prompt tells the model to skip bullet lists / headers and to
+// keep things short, but models don't always fully comply. This strips the
+// most obvious "AI assistant" formatting tells before anything gets sent,
+// WITHOUT touching fenced code blocks (```...```), since code itself should
+// stay exactly as written.
+function stripListFormattingOutsideCode(text) {
+    if (!text) return text;
+    const segments = text.split(/(```[\s\S]*?```)/g); // keep code fences intact
+    return segments
+        .map((seg, i) => {
+            if (i % 2 === 1) return seg; // odd index = inside a ``` code fence, leave untouched
+            return seg
+                .split('\n')
+                .map((line) => line.replace(/^\s*(?:[-*•]|\d+[.)])\s+/, ''))
+                .join('\n')
+                .replace(/^#{1,6}\s+/gm, ''); // drop stray markdown headers too
+        })
+        .join('');
+}
+
+// PERSONA UPDATE — splits one reply into multiple short "rapid-fire" Discord
+// messages instead of one polished paragraph, matching how a real person
+// texts (multiple quick messages) rather than how an assistant formats a
+// single tidy answer. Skips this behavior entirely for anything containing
+// a code block, since code answers should stay as one coherent message.
+function splitIntoCasualBeats(text) {
+    if (!text) return [text];
+    if (/```/.test(text)) return [text]; // never fragment a code block reply
+
+    const paragraphBeats = text
+        .split(/\n\s*\n/)
+        .map((p) => p.trim())
+        .filter(Boolean);
+    if (paragraphBeats.length > 1) return paragraphBeats;
+
+    // One long single paragraph with no natural break — split it roughly in
+    // half at a sentence boundary so it still reads like two quick messages
+    // instead of a single wall of text.
+    const only = paragraphBeats[0] || text.trim();
+    if (only.length > 220) {
+        const searchFrom = Math.floor(only.length * 0.35);
+        const idx = only.indexOf('. ', searchFrom);
+        if (idx !== -1 && idx < only.length - 20) {
+            return [only.slice(0, idx + 1).trim(), only.slice(idx + 1).trim()];
+        }
+    }
+    return [only];
+}
+
 function splitIntoChunks(text, maxLen = CHUNK_SIZE) {
     if (text.length <= maxLen) return [text];
     const chunks = [];
@@ -1696,7 +1775,12 @@ function splitIntoChunks(text, maxLen = CHUNK_SIZE) {
 // follow-up messages in the channel, same as the old multi-chunk behavior.
 async function deliverReplyViaThinkingMessage(thinkingMessage, message, text) {
     const safeText = text && text.trim() ? text : '(no response)';
-    const chunks = splitIntoChunks(safeText);
+    const cleaned = stripListFormattingOutsideCode(safeText);
+    // Casual "beats" first (rapid-fire multi-message feel), then each beat is
+    // still run through the hard Discord length-limit chunker just in case
+    // one beat itself is long (e.g. a code answer).
+    const beats = splitIntoCasualBeats(cleaned);
+    const chunks = beats.flatMap((beat) => splitIntoChunks(beat));
     try {
         await thinkingMessage.edit(chunks[0]);
     } catch (e) {
@@ -1705,6 +1789,9 @@ async function deliverReplyViaThinkingMessage(thinkingMessage, message, text) {
     }
     for (let i = 1; i < chunks.length; i++) {
         try {
+            // A little jitter on the delay between rapid-fire messages so it
+            // doesn't feel like a robotic, perfectly-timed drip.
+            await message.channel.sendTyping().catch(() => {});
             await message.channel.send(chunks[i]);
         } catch (e) {
             console.error(`Failed to send chunk ${i + 1}/${chunks.length}:`, e.message);
@@ -1712,7 +1799,7 @@ async function deliverReplyViaThinkingMessage(thinkingMessage, message, text) {
                 await message.channel.send(`⚠️ (part ${i + 1} of my reply failed to send: ${e.message})`);
             } catch (_) { /* give up quietly */ }
         }
-        if (i < chunks.length - 1) await new Promise((res) => setTimeout(res, 350));
+        if (i < chunks.length - 1) await new Promise((res) => setTimeout(res, 400 + Math.floor(Math.random() * 500)));
     }
 }
 
@@ -1984,6 +2071,7 @@ client.on('messageCreate', async (message) => {
                 tools: activeTools,
                 toolChoice: 'auto',
                 maxTokens: isCode ? MAX_TOKENS_CODE : MAX_TOKENS_CHAT,
+                temperature: CHAT_TEMPERATURE,
             });
             let choice = response.choices[0];
 
@@ -2014,7 +2102,7 @@ client.on('messageCreate', async (message) => {
                         content: JSON.stringify(toolResult),
                     });
                 }
-                response = await mistral.chat.complete({ model: TEXT_MODEL, messages, tools: activeTools, toolChoice: 'auto', maxTokens: MAX_TOKENS_CHAT });
+                response = await mistral.chat.complete({ model: TEXT_MODEL, messages, tools: activeTools, toolChoice: 'auto', maxTokens: MAX_TOKENS_CHAT, temperature: CHAT_TEMPERATURE });
                 choice = response.choices[0];
             }
             botReply = choice.message.content;
@@ -2028,7 +2116,7 @@ client.on('messageCreate', async (message) => {
                 continueGuard++;
                 messages.push({ role: 'assistant', content: botReply });
                 messages.push({ role: 'user', content: 'Continue exactly where you left off — do not repeat any earlier part of the answer.' });
-                const contResp = await mistral.chat.complete({ model: TEXT_MODEL, messages, maxTokens: MAX_TOKENS_CHAT });
+                const contResp = await mistral.chat.complete({ model: TEXT_MODEL, messages, maxTokens: MAX_TOKENS_CHAT, temperature: CHAT_TEMPERATURE });
                 const contText = contResp.choices[0].message.content || '';
                 botReply += contText;
                 response = contResp;
@@ -2037,7 +2125,7 @@ client.on('messageCreate', async (message) => {
             if (looksGarbled(botReply)) {
                 console.error('Mistral output looked garbled/mixed-script, retrying once.');
                 messages.push({ role: 'user', content: '(Your previous answer had a display glitch with mixed-up characters. Please answer again, using only normal text.)' });
-                const retryResp = await mistral.chat.complete({ model: TEXT_MODEL, messages, maxTokens: isCode ? MAX_TOKENS_CODE : MAX_TOKENS_CHAT });
+                const retryResp = await mistral.chat.complete({ model: TEXT_MODEL, messages, maxTokens: isCode ? MAX_TOKENS_CODE : MAX_TOKENS_CHAT, temperature: CHAT_TEMPERATURE });
                 botReply = retryResp.choices[0].message.content || botReply;
             }
             providerUsed = `mistral/${TEXT_MODEL}`;
@@ -2068,12 +2156,15 @@ client.on('messageCreate', async (message) => {
         if (thinkingMessage) {
             await deliverReplyViaThinkingMessage(thinkingMessage, message, botReply);
         } else {
-            // Placeholder failed to send earlier (rare) — fall back to a normal reply chain.
-            const chunks = splitIntoChunks(botReply && botReply.trim() ? botReply : '(no response)');
+            // Placeholder failed to send earlier (rare) — fall back to a normal reply chain,
+            // still using the same casual formatting/beats cleanup as the main path.
+            const cleaned = stripListFormattingOutsideCode(botReply && botReply.trim() ? botReply : '(no response)');
+            const beats = splitIntoCasualBeats(cleaned);
+            const chunks = beats.flatMap((beat) => splitIntoChunks(beat));
             for (let i = 0; i < chunks.length; i++) {
                 if (i === 0) await message.reply(chunks[i]);
                 else await message.channel.send(chunks[i]);
-                if (i < chunks.length - 1) await new Promise((res) => setTimeout(res, 350));
+                if (i < chunks.length - 1) await new Promise((res) => setTimeout(res, 400 + Math.floor(Math.random() * 500)));
             }
         }
     } catch (error) {
