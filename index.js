@@ -60,7 +60,7 @@ const CHUNK_SIZE = 1900; // leave headroom under Discord's 2000 char limit
 // which is what made long answers look "stuck" after a couple of chunks —
 // the model's own output was being truncated before it ever got to Discord's
 // chunking logic.
-const MAX_TOKENS_CHAT = 2500;
+const MAX_TOKENS_CHAT = 400; // deliberately low — normal chat should be 1-3 short sentences; code/detailed answers use MAX_TOKENS_CODE or an explicit "detailed" verbosity setting instead
 const MAX_TOKENS_CODE = 3500;
 const MAX_TOKENS_VISION = 2000;
 const MAX_CONTINUATIONS = 3; // safety cap on auto-continue-when-truncated loop
@@ -805,6 +805,15 @@ async function buildSystemPrompt(guildId, userId, channelId, isPrivateAiChannel,
         }
     }
     sys += PERSONA_IMMUTABILITY_NOTE;
+    // Placed LAST, after everything else — models weight instructions near
+    // the end of a long system prompt more heavily, and this prompt has
+    // grown a lot of sections above. Without a reminder here, the "keep it
+    // short, talk like a person" instruction buried near the top tends to
+    // get drowned out, especially once tools/memory context are injected.
+    sys += '\n\nFINAL REMINDER (this matters more than anything above): reply the way someone would in a live ' +
+           'Discord chat — usually 1-3 short sentences, lowercase-casual, no headers, no numbered/bulleted lists, ' +
+           'no "in summary" wrap-ups. Only go long if the person is clearly asking for a code block, a written ' +
+           'explanation "in detail", or a document/list they explicitly requested.';
     return sys;
 }
 function looksLikeCode(text) {
@@ -2185,10 +2194,36 @@ client.on('messageCreate', async (message) => {
             });
             let choice = response.choices[0];
 
+            // Normalizes an SDK message's `content` field down to a plain string.
+            // The SDK type allows content to be a string, an array of ContentChunk
+            // objects, null, or undefined (e.g. a pure tool-call turn has no text
+            // at all). Previously this raw value flowed straight into botReply and
+            // into messages.push(choice.message) below — if it was null/array,
+            // downstream string ops (stripListFormattingOutsideCode, Discord's
+            // .edit/.reply) or the next outbound SDK call could throw, which is
+            // what surfaced to users as "Something went wrong connecting to the AI."
+            function contentToText(content) {
+                if (typeof content === 'string') return content;
+                if (Array.isArray(content)) {
+                    return content
+                        .map((chunk) => (chunk && typeof chunk.text === 'string' ? chunk.text : ''))
+                        .join('')
+                        .trim();
+                }
+                return '';
+            }
+
             let guard = 0;
             while (choice.message.toolCalls && choice.message.toolCalls.length && guard < 5) {
                 guard++;
-                messages.push(choice.message);
+                // Push a clean, minimal assistant turn instead of the raw SDK
+                // object — only the fields the API actually needs on the way
+                // back in, with content normalized to a string (never null).
+                messages.push({
+                    role: 'assistant',
+                    content: contentToText(choice.message.content),
+                    toolCalls: choice.message.toolCalls,
+                });
                 for (const call of choice.message.toolCalls) {
                     const fnName = call.function.name;
                     let args = {};
@@ -2212,10 +2247,18 @@ client.on('messageCreate', async (message) => {
                         content: JSON.stringify(toolResult),
                     });
                 }
-                response = await mistral.chat.complete({ model: TEXT_MODEL, messages, tools: activeTools, toolChoice: 'auto', maxTokens: MAX_TOKENS_CHAT, temperature: CHAT_TEMPERATURE });
+                try {
+                    response = await mistral.chat.complete({ model: TEXT_MODEL, messages, tools: activeTools, toolChoice: 'auto', maxTokens: MAX_TOKENS_CHAT, temperature: CHAT_TEMPERATURE });
+                } catch (e) {
+                    // A tool round can legitimately fail (bad params, transient
+                    // API error). Don't let the whole reply die silently — fall
+                    // back to a plain-text answer using whatever we already know.
+                    console.error('Tool-calling follow-up request failed, falling back to plain text:', e.message);
+                    response = await mistral.chat.complete({ model: TEXT_MODEL, messages: messages.filter((m) => m.role !== 'tool' || true), maxTokens: MAX_TOKENS_CHAT, temperature: CHAT_TEMPERATURE });
+                }
                 choice = response.choices[0];
             }
-            botReply = choice.message.content;
+            botReply = contentToText(choice.message.content);
 
             // FIX (truncation): if the final answer was cut off purely because
             // it hit the token cap (finishReason === 'length'), automatically
